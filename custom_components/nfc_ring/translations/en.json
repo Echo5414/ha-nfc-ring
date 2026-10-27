@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "NFC Ring",
+        "description": "Receives scans from NFC rings in your Thread network (UDP port 5683) and reports them as tag scans. Scanned tags appear under Settings → Tags."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "NFC Ring is already set up."
+    }
+  }
+}

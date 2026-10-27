@@ -1,0 +1,14 @@
+{
+  "domain": "nfc_ring",
+  "name": "NFC Ring",
+  "codeowners": ["@Echo5414"],
+  "config_flow": true,
+  "dependencies": ["tag"],
+  "documentation": "https://github.com/Echo5414/ha-nfc-ring",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/Echo5414/ha-nfc-ring/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.4.0"
+}
