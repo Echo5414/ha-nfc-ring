@@ -1,9 +1,10 @@
 """Overview page in the sidebar: the rings, the tags and what each tag triggers.
 
 The page is a small web component (frontend/nfc-ring-panel.js) that asks for
-everything it shows with one websocket command, nfc_ring/overview, and pairs
-a ring with nfc_ring/pair. It can be switched off in the integration's
-options; a ring can then still be paired there.
+everything it shows with one websocket command, nfc_ring/overview, pairs a
+ring with nfc_ring/pair and chooses a ring's radio with nfc_ring/set_radio.
+It can be switched off in the integration's options; a ring can then still
+be paired there, and its radio chosen on its device page.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.loader import async_get_integration
 
-from .const import CONF_SHOW_PANEL, DOMAIN
+from .const import CONF_SHOW_PANEL, DOMAIN, RADIO_THREAD, RADIO_ZIGBEE
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ async def async_setup(hass: HomeAssistant) -> None:
     )
     websocket_api.async_register_command(hass, _ws_overview)
     websocket_api.async_register_command(hass, _ws_pair)
+    websocket_api.async_register_command(hass, _ws_set_radio)
 
 
 @callback
@@ -111,6 +113,49 @@ def _ws_pair(
         connection.send_error(msg["id"], "failed", str(err))
         return
     connection.send_result(msg["id"], {"status": "paired" if dev else "waiting", "dev": dev})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/set_radio",
+        vol.Required("dev"): str,
+        vol.Required("radio"): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _ws_set_radio(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Chooses a ring's radio; "applied" False if the ring follows later."""
+    server = _server(hass)
+    if server is None:
+        connection.send_error(msg["id"], "not_loaded", "NFC Ring is not running")
+        return
+    try:
+        applied = await server.async_set_radio(msg["dev"], msg["radio"])
+    except HomeAssistantError as err:
+        connection.send_error(msg["id"], "failed", str(err))
+        return
+    connection.send_result(msg["id"], {"applied": applied})
+
+
+@callback
+def _radio(server, dev: str, ring) -> dict[str, Any]:
+    """What the page shows about a ring's radio."""
+    if ring.wanted is None:
+        waits = None
+    elif ring.radio is None or ring.wanted == RADIO_ZIGBEE:
+        waits = "update"  # takes another firmware first
+    else:
+        waits = "contact"  # told at the ring's next contact
+    return {
+        "radio": ring.wanted or ring.radio or RADIO_THREAD,
+        "radio_waits": waits,
+        "radios": server.radios_for(dev),
+        "link": ring.link,
+        "board": ring.board,
+    }
 
 
 @callback
@@ -233,6 +278,7 @@ def build_overview(hass: HomeAssistant) -> dict[str, Any]:
                     "update_available": update_available,
                     "disabled": device.disabled_by is not None,
                     "last_scan": last_scan.get(device.id),
+                    **(_radio(server, dev, ring) if ring is not None else {}),
                 }
             )
     rings.sort(key=lambda r: (r["name"] or "").lower())

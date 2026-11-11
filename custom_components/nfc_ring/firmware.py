@@ -1,11 +1,20 @@
 """Firmware images offered to the rings: the local folder and GitHub releases.
 
-Images are MCUboot-signed .bin files. The newest one wins, whether it was
-dropped into <config>/nfc_ring_firmware by hand or published as the asset of
-the latest release in FIRMWARE_REPOSITORY. A release image is downloaded
-into the releases/ subfolder right before it is installed. That cache only
-counts while it matches the current release, so a withdrawn release is not
-offered again, and it never mixes with hand-placed images.
+Images are MCUboot-signed .bin files named for what they run on:
+
+    nfc-ring-<board>-<build>-<version>.bin     e.g. nfc-ring-xiao_nrf54l15-thread-0.5.0.bin
+
+The board is the hardware, the build says which radios the image contains
+("thread": Thread and Bluetooth; "zigbee": Zigbee). A ring is only ever
+offered images for its own board. Files named nfc-ring-<version>.bin are
+from before 0.5.0 and count as xiao_nrf54l15/thread; other names are ignored.
+
+Per board and build the newest image wins, whether it was dropped into
+<config>/nfc_ring_firmware by hand or published as an asset of the latest
+release in FIRMWARE_REPOSITORY. A release image is downloaded into the
+releases/ subfolder right before it is installed. That cache only counts
+while it matches the current release, so a withdrawn release is not offered
+again, and it never mixes with hand-placed images.
 
 Nothing here has to be trusted: the ring's bootloader refuses any image that
 is not signed with the project key. The checks below only avoid sending a
@@ -41,14 +50,24 @@ class FirmwareError(Exception):
     """A firmware image could not be found, fetched or validated."""
 
 
+# (board, build)
+type Target = tuple[str, str]
+
+
 @dataclass(frozen=True)
 class Firmware:
     version: str
     size: int
+    board: str = coap.LEGACY_BOARD
+    variant: str = coap.LEGACY_VARIANT
     path: Path | None = None  # local image; None for a release not downloaded yet
     url: str | None = None  # release asset to download
     release_url: str | None = None
     release_notes: str | None = None
+
+    @property
+    def target(self) -> Target:
+        return self.board, self.variant
 
 
 def newest(*candidates: Firmware | None) -> Firmware | None:
@@ -62,15 +81,22 @@ def newest(*candidates: Firmware | None) -> Firmware | None:
     return best
 
 
-def find_local(directory: Path) -> Firmware | None:
-    """Newest valid image in directory (blocking, run it in the executor)."""
-    best: Firmware | None = None
+def find_local(directory: Path) -> dict[Target, Firmware]:
+    """Newest valid image per board and build in directory (blocking)."""
+    best: dict[Target, Firmware] = {}
     try:
         files = sorted(directory.glob("*.bin"))
     except OSError:
-        return None
+        return best
 
     for path in files:
+        target = coap.image_target(path.name)
+        if target is None:
+            _LOGGER.warning(
+                "Ignoring firmware file %s: name it nfc-ring-<board>-<build>-<version>.bin",
+                path.name,
+            )
+            continue
         try:
             size = path.stat().st_size
             if size > MAX_IMAGE_SIZE:
@@ -80,12 +106,12 @@ def find_local(directory: Path) -> Firmware | None:
         except (OSError, ValueError) as err:
             _LOGGER.warning("Ignoring firmware file %s: %s", path.name, err)
             continue
-        best = newest(best, Firmware(version, size, path=path))
+        best[target] = newest(best.get(target), Firmware(version, size, *target, path=path))
     return best
 
 
-async def async_fetch_latest_release(hass: HomeAssistant, repository: str) -> Firmware | None:
-    """The image attached to the latest release, or None if there is none."""
+async def async_fetch_latest_release(hass: HomeAssistant, repository: str) -> dict[Target, Firmware]:
+    """The images attached to the latest release, by board and build."""
     session = async_get_clientsession(hass)
     url = f"{GITHUB_API}/repos/{repository}/releases/latest"
     try:
@@ -94,7 +120,7 @@ async def async_fetch_latest_release(hass: HomeAssistant, repository: str) -> Fi
         ) as resp:
             if resp.status == 404:
                 _LOGGER.debug("No firmware release published in %s", repository)
-                return None
+                return {}
             resp.raise_for_status()
             release = await resp.json()
     except (aiohttp.ClientError, TimeoutError, ValueError) as err:
@@ -108,38 +134,38 @@ async def async_fetch_latest_release(hass: HomeAssistant, repository: str) -> Fi
     if not coap.is_version(version):
         raise FirmwareError(f"latest release tag {tag!r} in {repository} is not a version")
 
-    assets = release.get("assets")
-    asset = next(
-        (
-            a
-            for a in (assets if isinstance(assets, list) else [])
-            if isinstance(a, dict) and str(a.get("name", "")).endswith(".bin")
-        ),
-        None,
-    )
-    if asset is None:
-        raise FirmwareError(f"release {tag} in {repository} has no .bin image")
-
-    size = asset.get("size")
-    download_url = asset.get("browser_download_url")
-    if not (isinstance(size, int) and 0 < size <= MAX_IMAGE_SIZE):
-        raise FirmwareError(f"release {tag}: image size {size!r} is not plausible")
-    if not (isinstance(download_url, str) and download_url.startswith("https://")):
-        raise FirmwareError(f"release {tag}: no usable download URL")
-
     notes = release.get("body")
     html_url = release.get("html_url")
-    return Firmware(
-        version,
-        size,
-        url=download_url,
-        release_url=html_url if isinstance(html_url, str) else None,
-        release_notes=notes if isinstance(notes, str) and notes.strip() else None,
-    )
+    assets = release.get("assets")
+    images: dict[Target, Firmware] = {}
+    for asset in assets if isinstance(assets, list) else []:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name", ""))
+        target = coap.image_target(name)
+        if target is None or target in images:
+            continue
+        size = asset.get("size")
+        download_url = asset.get("browser_download_url")
+        if not (isinstance(size, int) and 0 < size <= MAX_IMAGE_SIZE):
+            raise FirmwareError(f"release {tag}: size {size!r} of {name} is not plausible")
+        if not (isinstance(download_url, str) and download_url.startswith("https://")):
+            raise FirmwareError(f"release {tag}: no usable download URL for {name}")
+        images[target] = Firmware(
+            version,
+            size,
+            *target,
+            url=download_url,
+            release_url=html_url if isinstance(html_url, str) else None,
+            release_notes=notes if isinstance(notes, str) and notes.strip() else None,
+        )
+    if not images:
+        raise FirmwareError(f"release {tag} in {repository} has no firmware image")
+    return images
 
 
 def _cache_path(cache_dir: Path, firmware: Firmware) -> Path:
-    return cache_dir / f"nfc-ring-{firmware.version}.bin"
+    return cache_dir / f"nfc-ring-{firmware.board}-{firmware.variant}-{firmware.version}.bin"
 
 
 def cached_release(cache_dir: Path, firmware: Firmware) -> Firmware:
@@ -191,7 +217,7 @@ async def async_download(hass: HomeAssistant, firmware: Firmware, cache_dir: Pat
 
 
 def _store_release(path: Path, data: bytes) -> None:
-    """Writes path atomically and drops older cached releases (blocking)."""
+    """Writes path atomically and drops the older cached release it replaces (blocking)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".download-", suffix=".part")
     try:
@@ -202,6 +228,7 @@ def _store_release(path: Path, data: bytes) -> None:
         Path(tmp).unlink(missing_ok=True)
         raise
 
+    target = coap.image_target(path.name)
     for old in path.parent.glob("*.bin"):
-        if old != path:
+        if old != path and coap.image_target(old.name) in (target, None):
             old.unlink(missing_ok=True)

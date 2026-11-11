@@ -1,7 +1,8 @@
 // Overview page of the NFC Ring integration: rings, tags and what each tag triggers.
 // Plain web component, no build step. All data comes from the websocket command
 // nfc_ring/overview; the page reloads it when a tag, automation or update changes.
-// A new ring is paired by entering the code from its packaging (nfc_ring/pair).
+// A new ring is paired by entering the code from its packaging (nfc_ring/pair);
+// its radio is chosen in the table (nfc_ring/set_radio).
 
 const TEXT = {
   en: {
@@ -44,6 +45,15 @@ const TEXT = {
     manageTags: "Manage tags",
     ringHint: "Select a ring to rename, deactivate or delete it. A deactivated ring's scans are ignored; a deleted ring needs its code again.",
     error: "The overview could not be loaded.",
+    radio: "Radio",
+    radioThread: "Thread",
+    radioBluetooth: "Bluetooth",
+    radioZigbee: "Zigbee",
+    radioZigbeeSoon: "Zigbee (not available yet)",
+    radioWaitsContact: "The ring switches at its next contact.",
+    radioWaitsUpdate: "Update the firmware; the ring switches by itself afterwards.",
+    radioViaBluetooth: "Not in the Thread network yet; reached over Bluetooth.",
+    radioFailed: "The radio was not changed: {e}",
     justNow: "just now",
   },
   de: {
@@ -86,6 +96,15 @@ const TEXT = {
     manageTags: "Tags verwalten",
     ringHint: "Ring anklicken, um ihn umzubenennen, zu deaktivieren oder zu löschen. Scans eines deaktivierten Rings werden ignoriert; ein gelöschter Ring braucht seinen Code erneut.",
     error: "Die Übersicht konnte nicht geladen werden.",
+    radio: "Funkart",
+    radioThread: "Thread",
+    radioBluetooth: "Bluetooth",
+    radioZigbee: "Zigbee",
+    radioZigbeeSoon: "Zigbee (noch nicht verfügbar)",
+    radioWaitsContact: "Der Ring wechselt bei seinem nächsten Kontakt.",
+    radioWaitsUpdate: "Firmware aktualisieren, danach wechselt der Ring von selbst.",
+    radioViaBluetooth: "Noch nicht im Thread-Netz, über Bluetooth erreichbar.",
+    radioFailed: "Die Funkart wurde nicht geändert: {e}",
     justNow: "gerade eben",
   },
 };
@@ -190,6 +209,38 @@ class NfcRingPanel extends HTMLElement {
     await this._load();
   }
 
+  async _setRadio(dev, radio) {
+    const t = this._t;
+    if (this._radioBusy) return;
+    this._radioBusy = true;
+    this._radioMsg = null;
+    try {
+      await this._hass.callWS({ type: "nfc_ring/set_radio", dev, radio });
+    } catch (err) {
+      this._radioMsg = { kind: "err", text: t.radioFailed.replace("{e}", err?.message || "?") };
+    } finally {
+      this._radioBusy = false;
+    }
+    await this._load();
+  }
+
+  _radioCell(r) {
+    const t = this._t;
+    const names = { thread: t.radioThread, bluetooth: t.radioBluetooth, zigbee: t.radioZigbee };
+    if (!r.radio) return `<span class="muted">–</span>`;
+    let note = "";
+    if (r.radio_waits === "update") note = t.radioWaitsUpdate;
+    else if (r.radio_waits === "contact") note = t.radioWaitsContact;
+    else if (r.radio === "thread" && r.link === "bluetooth") note = t.radioViaBluetooth;
+    note = note ? `<div class="note">${note}</div>` : "";
+    if (!r.paired || !this._hass?.user?.is_admin) return `${esc(names[r.radio] || r.radio)}${note}`;
+    const options = (r.radios || [])
+      .map((o) => `<option value="${esc(o)}"${o === r.radio ? " selected" : ""}>${esc(names[o] || o)}</option>`)
+      .join("");
+    const soon = (r.radios || []).includes("zigbee") ? "" : `<option disabled>${t.radioZigbeeSoon}</option>`;
+    return `<select class="radio" data-dev="${esc(r.dev)}" aria-label="${t.radio}">${options}${soon}</select>${note}`;
+  }
+
   _when(iso) {
     const t = this._t;
     if (!iso) return `<span class="muted">${t.never}</span>`;
@@ -226,6 +277,7 @@ class NfcRingPanel extends HTMLElement {
           <td data-l="${t.name}"><div><a href="/config/devices/device/${esc(r.id)}">${esc(r.name)}</a></div></td>
           <td data-l="${t.status}"><div>${status}</div></td>
           <td data-l="${t.pairing}"><div>${pairing}</div></td>
+          <td data-l="${t.radio}"><div>${this._radioCell(r)}</div></td>
           <td data-l="${t.firmware}"><div>${fw}</div></td>
           <td data-l="${t.lastScan}"><div>${this._when(r.last_scan)}</div></td>
           <td data-l="${t.id}" class="mono"><div>${esc(r.dev || "–")}</div></td>
@@ -240,6 +292,7 @@ class NfcRingPanel extends HTMLElement {
           <td data-l="${t.name}"><div>${esc(t.newRing.replace("{id}", p.dev.slice(-4).toUpperCase()))}</div></td>
           <td data-l="${t.status}"><div><span class="muted">–</span></div></td>
           <td data-l="${t.pairing}"><div>${pairing}</div></td>
+          <td data-l="${t.radio}"><div><span class="muted">–</span></div></td>
           <td data-l="${t.firmware}"><div>${esc(p.firmware || "–")}</div></td>
           <td data-l="${t.lastScan}"><div><span class="muted">–</span></div></td>
           <td data-l="${t.id}" class="mono"><div>${esc(p.dev)}</div></td>
@@ -303,8 +356,9 @@ class NfcRingPanel extends HTMLElement {
       const pending = data.pending || [];
       const rings = data.rings.length + pending.length
         ? `<div class="scroll"><table>
-            <thead><tr><th>${t.name}</th><th>${t.status}</th><th>${t.pairing}</th><th>${t.firmware}</th><th>${t.lastScan}</th><th>${t.id}</th></tr></thead>
+            <thead><tr><th>${t.name}</th><th>${t.status}</th><th>${t.pairing}</th><th>${t.radio}</th><th>${t.firmware}</th><th>${t.lastScan}</th><th>${t.id}</th></tr></thead>
             <tbody>${this._ringRows(data.rings, pending)}</tbody></table></div>
+           ${this._radioMsg ? `<p class="msg ${this._radioMsg.kind}">${esc(this._radioMsg.text)}</p>` : ""}
            ${data.rings.length ? `<p class="hint">${t.ringHint}</p>` : ""}`
         : `<p class="empty">${t.noRings}</p>`;
       const tags = data.tags.length
@@ -324,6 +378,12 @@ class NfcRingPanel extends HTMLElement {
           ${tags}
         </section>`;
     }
+    // Rebuilding the page must not close a radio list that is open.
+    if (this.shadowRoot.activeElement?.matches?.("select.radio") && !this._radioBusy) {
+      this._renderLater = true;
+      return;
+    }
+    this._renderLater = false;
     // Rebuilding the page must not eat a code that is being typed.
     const before = this.shadowRoot.querySelector("#code");
     const typed = before?.value || "";
@@ -348,6 +408,15 @@ class NfcRingPanel extends HTMLElement {
         this._pair();
       });
     }
+    this.shadowRoot.querySelectorAll("select.radio").forEach((select) => {
+      select.addEventListener("change", () => {
+        select.blur();
+        this._setRadio(select.dataset.dev, select.value);
+      });
+      select.addEventListener("blur", () => {
+        if (this._renderLater) this._render();
+      });
+    });
     // Internal links: let Home Assistant navigate instead of reloading the app.
     this.shadowRoot.querySelectorAll('a[href^="/"]').forEach((a) =>
       a.addEventListener("click", (ev) => {
@@ -404,6 +473,9 @@ const STYLE = `
   .pair input:focus-visible, .pair button:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 1px; }
   .pair button { height: 40px; padding: 0 18px; font: inherit; font-weight: 500; cursor: pointer; border: none; border-radius: 8px;
                  color: var(--text-primary-color, #fff); background: var(--primary-color); }
+  select.radio { font: inherit; height: 32px; padding: 0 6px; color: var(--primary-text-color);
+                 background: var(--secondary-background-color); border: 1px solid var(--divider-color, #e0e0e0); border-radius: 8px; }
+  select.radio:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 1px; }
   .msg { font-size: 14px; margin: 0; padding: 8px 20px 4px; }
   .msg.ok { color: var(--success-color, #2e7d32); }
   .msg.err { color: var(--error-color, #c62828); }

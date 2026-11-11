@@ -50,6 +50,9 @@ def main() -> int:
     hello = sub.add_parser("hello")
     hello.add_argument("--fw", default="0.4.0")
     hello.add_argument("--trial", action="store_true", help="firmware not confirmed yet")
+    hello.add_argument("--board", help="say hello like firmware 0.5.0 on, naming this board")
+    hello.add_argument("--var", default="thread", help="firmware build (with --board)")
+    hello.add_argument("--radio", default="thread", help="radio in use (with --board)")
     scan = sub.add_parser("scan")
     scan.add_argument("--uid", default="04D00D")
     scan.add_argument("--seq", type=int, default=1)
@@ -62,7 +65,14 @@ def main() -> int:
         fields: dict[str, object] = {
             "dev": args.dev, "fw": args.fw, "sid": args.sid, "confirmed": not args.trial,
         }
-        text = auth.hello_text(args.dev, args.fw, args.sid, not args.trial, args.boot, args.n)
+        if args.board:
+            fields.update(board=args.board, var=args.var, radio=args.radio)
+            text = auth.hello2_text(
+                args.dev, args.fw, args.board, args.var, args.radio,
+                args.sid, not args.trial, args.boot, args.n,
+            )
+        else:
+            text = auth.hello_text(args.dev, args.fw, args.sid, not args.trial, args.boot, args.n)
         path = coap.HELLO_PATH
     else:
         fields = {"dev": args.dev, "uid": args.uid, "sid": args.sid, "seq": args.seq}

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 from dataclasses import dataclass
 from enum import Enum, auto
 
@@ -71,9 +72,49 @@ def hello_text(dev: str, fw: str, sid: int, confirmed: bool, boot: int, n: int) 
     return f"hello|{dev}|{fw}|{sid}|{int(confirmed)}|{boot}|{n}"
 
 
+def hello2_text(
+    dev: str, fw: str, board: str, variant: str, radio: str, sid: int, confirmed: bool, boot: int, n: int
+) -> str:
+    """Hello from firmware 0.5.0 on: also names the board, the build and the radio in use."""
+    return f"hello2|{dev}|{fw}|{board}|{variant}|{radio}|{sid}|{int(confirmed)}|{boot}|{n}"
+
+
+def ble_scan_text(dev: str, uid: str, boot: int, n: int) -> str:
+    """Scan sent as a Bluetooth advertisement (no room for sid and seq)."""
+    return f"blescan|{dev}|{uid}|{boot}|{n}"
+
+
+def ack_text(dev: str, boot: int, n: int) -> str:
+    """Home Assistant's answer to the hello with this boot and n, over Bluetooth."""
+    return f"ack|{dev}|{boot}|{n}"
+
+
 def notify_text(dev: str, sid: int, version: str, size: int) -> str:
     """Update notice from Home Assistant; sid ties it to the ring's current boot."""
     return f"dfu|{dev}|{sid}|{version}|{size}"
+
+
+_CFG_LABEL = b"nfc-ring cfg v1"
+CFG_RADIOS = ("thread", "bluetooth")
+
+
+def seal_cfg(key: bytes, dev: str, sid: int, boot: int, ctr: int, settings: dict) -> bytes:
+    """A settings message for a ring: boot, ctr, then the encrypted settings.
+
+    settings may hold "radio", "dataset" (Thread dataset as hex) and "server"
+    (IPv6 address). They are encrypted because the dataset is the key to the
+    Thread network: AES-128-CCM under a key derived from the pairing key,
+    bound to this ring (dev), its current start (boot, sid) and ctr, which
+    must grow with every message.
+    """
+    # Only this function needs it; tools that just verify messages do not.
+    from cryptography.hazmat.primitives.ciphers.aead import AESCCM  # noqa: PLC0415
+
+    cfg_key = hmac.new(key, _CFG_LABEL, hashlib.sha256).digest()[:16]
+    head = boot.to_bytes(4, "little") + ctr.to_bytes(4, "little")
+    nonce = boot.to_bytes(4, "little") + sid.to_bytes(4, "little") + ctr.to_bytes(4, "little")
+    plain = json.dumps(settings, separators=(",", ":")).encode()
+    return head + AESCCM(cfg_key, tag_length=16).encrypt(nonce, plain, f"cfg|{dev}".encode())
 
 
 class Freshness(Enum):

@@ -92,3 +92,11 @@ Deleting the ring's device forgets the key.
   only) and in backups.
 - Firmware downgrade to a version without signatures is not prevented by
   this scheme; the bootloader only checks the project's signature.
+
+## Later additions
+
+Firmware 0.5.0 adds a longer hello (`hello2|…`, with board, build and
+radio), signed answers to a hello over Bluetooth (`ack|dev|boot|n`), scans
+over Bluetooth (`blescan|dev|UID|boot|n`) and encrypted settings. They use
+the same key and the same replay rules and are described in
+[BLUETOOTH.md](BLUETOOTH.md).

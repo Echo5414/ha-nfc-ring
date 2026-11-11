@@ -15,7 +15,6 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import NfcRingConfigEntry, RingServer
-from .coap import version_key
 from .const import DOMAIN, SIGNAL_FIRMWARE_CHANGED, SIGNAL_RING_ADDED, SIGNAL_RING_CHANGED
 from .firmware import Firmware
 
@@ -66,15 +65,8 @@ class RingFirmwareUpdate(UpdateEntity):
 
     @property
     def _offered(self) -> Firmware | None:
-        """The newest image if it is newer than the running firmware."""
-        installed = self.installed_version
-        firmware = self._server.firmware
-        # Never offer an older image than the one running.
-        if firmware is None or (
-            installed is not None and version_key(firmware.version) <= version_key(installed)
-        ):
-            return None
-        return firmware
+        """The image for this ring's board, if it is newer or another build was chosen."""
+        return self._server.offered_firmware(self._dev)
 
     @property
     def installed_version(self) -> str | None:
@@ -84,7 +76,13 @@ class RingFirmwareUpdate(UpdateEntity):
     @property
     def latest_version(self) -> str | None:
         offered = self._offered
-        return offered.version if offered else self.installed_version
+        if offered is None:
+            return self.installed_version
+        if offered.version == self.installed_version:
+            # Another build of the same version (the Zigbee firmware): Home
+            # Assistant only sees an update if the names differ.
+            return f"{offered.version} ({offered.variant})"
+        return offered.version
 
     @property
     def release_url(self) -> str | None:

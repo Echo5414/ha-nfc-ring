@@ -42,8 +42,9 @@ SCAN_PATH = "nfc"
 HELLO_PATH = "hello"
 FIRMWARE_PATH = "fw"  # GET fw/<device id> with Block2
 NOTIFY_PATH = "dfu"  # POST to the ring: an update is waiting
+CONFIG_PATH = "cfg"  # POST to the ring: encrypted settings (auth.seal_cfg)
 
-# A signed scan or hello is ~140 bytes; the cap also keeps json.loads far from
+# A signed scan is ~140 bytes, a hello up to ~200; the cap also keeps json.loads far from
 # Python's recursion limit on hostile input like "[[[[...".
 MAX_PAYLOAD = 256
 
@@ -64,7 +65,19 @@ _DEV_RE = re.compile(r"[0-9a-f]{16}")
 _UID_RE = re.compile(r"(?:[0-9A-F]{2}){1,10}")
 _VERSION_RE = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,5}")
 _MAC_RE = re.compile(r"[0-9a-f]{16}")
+# Board, build variant and radio names; "|" must stay out, it separates the
+# fields of the signed text.
+_NAME_RE = re.compile(r"[a-z0-9_]{1,24}")
+
+# What firmware before 0.5.0 is: it does not say, and only this build existed.
+LEGACY_BOARD = "xiao_nrf54l15"
+LEGACY_VARIANT = "thread"
 _UINT32_MAX = 0xFFFFFFFF
+
+# Image files name what they are for: nfc-ring-<board>-<build>-<version>.bin.
+# The first releases had one build for one board and were named without both.
+_IMAGE_NAME_RE = re.compile(r"nfc-ring-([a-z0-9_]{1,24})-([a-z0-9_]{1,24})-\d+\.\d+\.\d+\.bin")
+_LEGACY_IMAGE_NAME_RE = re.compile(r"nfc-ring-\d+\.\d+\.\d+\.bin")
 
 
 @dataclass(frozen=True)
@@ -104,6 +117,11 @@ class Hello:
     boot: int | None = None
     n: int | None = None
     mac: str | None = None
+    # From firmware 0.5.0 on (all three or none): the board it runs on, which
+    # build it is (the radios it contains) and the radio it currently uses.
+    board: str | None = None
+    variant: str | None = None
+    radio: str | None = None
 
 
 @dataclass(frozen=True)
@@ -249,6 +267,13 @@ def build_notify(
     return build_message(TYPE_CON, CODE_POST, mid, token, options, payload)
 
 
+def build_config(mid: int, token: bytes, sealed: bytes) -> bytes:
+    """Confirmable POST /cfg carrying settings sealed with auth.seal_cfg."""
+    return build_message(
+        TYPE_CON, CODE_POST, mid, token, [(OPT_URI_PATH, CONFIG_PATH.encode())], sealed
+    )
+
+
 def _load_object(payload: bytes) -> dict:
     if len(payload) > MAX_PAYLOAD:
         raise ValueError(f"payload of {len(payload)} bytes is too large")
@@ -306,7 +331,12 @@ def parse_hello(payload: bytes) -> Hello:
         raise ValueError("bad sid")
     if not isinstance(confirmed, bool):
         raise ValueError("bad confirmed")
-    return Hello(dev, fw, sid, confirmed, *_signature(hello))
+    names = tuple(hello.get(k) for k in ("board", "var", "radio"))
+    if any(name is not None for name in names) and not all(
+        isinstance(name, str) and _NAME_RE.fullmatch(name) for name in names
+    ):
+        raise ValueError("bad board/var/radio")
+    return Hello(dev, fw, sid, confirmed, *_signature(hello), *names)
 
 
 def image_version(image: bytes) -> str:
@@ -322,6 +352,19 @@ def image_version(image: bytes) -> str:
     if magic != MCUBOOT_IMAGE_MAGIC:
         raise ValueError("not an MCUboot image")
     return f"{major}.{minor}.{revision}"
+
+
+def image_target(filename: str) -> tuple[str, str] | None:
+    """(board, build) an image file is for, going by its name; None if it does not say.
+
+    An image for the wrong board would be signed correctly and still not
+    run, so a file that does not name its board is never offered.
+    """
+    if (match := _IMAGE_NAME_RE.fullmatch(filename)) is not None:
+        return match[1], match[2]
+    if _LEGACY_IMAGE_NAME_RE.fullmatch(filename):
+        return LEGACY_BOARD, LEGACY_VARIANT
+    return None
 
 
 def is_version(text: str) -> bool:

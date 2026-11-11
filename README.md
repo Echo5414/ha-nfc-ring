@@ -3,8 +3,8 @@
 Tap your NFC Ring on any NFC sticker and Home Assistant runs the automation
 you picked for that sticker – switch a light, start a scene, anything.
 
-The ring talks to Home Assistant over **Thread**. This integration receives
-its scans, reports them through Home Assistant's built-in **Tags** feature
+The ring talks to Home Assistant over **Thread** or **Bluetooth**. This
+integration receives its scans, reports them through Home Assistant's built-in **Tags** feature
 and keeps the ring's firmware up to date.
 
 [![Open your Home Assistant instance and open this repository in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Echo5414&repository=ha-nfc-ring&category=integration)
@@ -13,7 +13,8 @@ and keeps the ring's firmware up to date.
 
 - Home Assistant 2026.3 or newer
 - A Thread border router in Home Assistant (for example the OpenThread
-  Border Router app with a Thread radio stick)
+  Border Router app with a Thread radio stick), or Bluetooth in Home
+  Assistant (ring firmware 0.5.0 or newer)
 - The Marketplace that is built into Home Assistant since 2026.11, or
   [HACS](https://hacs.xyz) on older versions
 
@@ -82,11 +83,28 @@ it last and the automations it triggers.
   choose **⋮ → Disable**. Its scans are then refused until you enable it
   again.
 
+## Choosing the radio
+
+Each paired ring has a **Radio** choice on the NFC Ring page (and as an
+entity on the ring's device): Thread or Bluetooth. Pick one; Home Assistant
+tells the ring, the ring switches and reports back. If the ring cannot be
+reached right now, or first needs a firmware update (0.5.0), the choice is
+noted and applied as soon as possible.
+
+- Switching to Thread sends the ring your Thread network, encrypted. A new
+  ring that is not on any network yet is found over Bluetooth and put on
+  your Thread network the same way.
+- Bluetooth needs a Home Assistant Bluetooth adapter or proxy that can
+  connect to devices. Range is a few metres around it.
+- Zigbee is planned as a separate firmware and is not available yet.
+
+Details: [BLUETOOTH.md](BLUETOOTH.md).
+
 ## Firmware updates
 
 New ring firmware appears under **Settings → Updates** like any other
 update; install it there. The ring downloads it over Thread (about two and a
-half minutes) and restarts.
+half minutes) or Bluetooth and restarts.
 
 - The ring only runs firmware signed by this project. Anything else is
   refused.
@@ -96,7 +114,12 @@ half minutes) and restarts.
 Releases come from
 [Echo5414/nfc-ring-releases](https://github.com/Echo5414/nfc-ring-releases/releases).
 To try your own build, put the signed `.bin` into
-`/config/nfc_ring_firmware/`; the highest version there or on GitHub wins.
+`/config/nfc_ring_firmware/` and restart Home Assistant; the highest
+version there or on GitHub wins. The file name says what it is for:
+`nfc-ring-<board>-<build>-<version>.bin`, for example
+`nfc-ring-xiao_nrf54l15-thread-0.5.0.bin`. A ring is only offered images
+for its own board and build. Files with other names are ignored
+(`nfc-ring-<version>.bin` counts as the XIAO Thread build).
 
 ## Security
 
