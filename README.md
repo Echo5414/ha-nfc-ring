@@ -14,14 +14,28 @@ and keeps the ring's firmware up to date.
 - Home Assistant 2026.3 or newer
 - A Thread border router in Home Assistant (for example the OpenThread
   Border Router app with a Thread radio stick)
-- [HACS](https://hacs.xyz)
+- The Marketplace that is built into Home Assistant since 2026.11, or
+  [HACS](https://hacs.xyz) on older versions
 
 ## Installation
+
+**Home Assistant 2026.11 or newer (Marketplace):**
+
+1. Open **Marketplace** in the sidebar, use the add-by-link button at the
+   top right and enter `https://github.com/Echo5414/ha-nfc-ring`
+   (type *Integration*).
+2. Open *NFC Ring* in the list, click **Download**, then restart Home
+   Assistant.
+
+**Older versions (HACS):**
 
 1. Click the button above (or in HACS: ⋮ → *Custom repositories* → add
    `https://github.com/Echo5414/ha-nfc-ring` as *Integration*).
 2. Click **Download**, then restart Home Assistant.
-3. **Settings → Devices & services → Add integration → NFC Ring.**
+
+**Then, on every version:**
+
+**Settings → Devices & services → Add integration → NFC Ring.**
 
 ## Using it
 
