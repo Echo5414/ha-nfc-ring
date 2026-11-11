@@ -120,6 +120,15 @@ def _server(hass: HomeAssistant):
     return None
 
 
+def _signs(firmware: str | None) -> bool:
+    """True for a firmware that signs its messages (0.4.0 and newer)."""
+    try:
+        major, minor = (int(part) for part in str(firmware).split(".")[:2])
+    except ValueError:
+        return False
+    return (major, minor) >= (0, 4)
+
+
 def _as_list(value: Any) -> list:
     if value is None:
         return []
@@ -215,7 +224,9 @@ def build_overview(hass: HomeAssistant) -> dict[str, Any]:
                     # False: known from before pairing existed, still unsigned.
                     "paired": ring is not None and ring.key is not None,
                     # Its firmware signs, so entering the code is all it takes.
-                    "can_pair": ring is not None and ring.candidate is not None,
+                    # After a restart nothing signed was heard yet; go by the version.
+                    "can_pair": ring is not None
+                    and (ring.candidate is not None or _signs(device.sw_version)),
                     "name": device.name_by_user or device.name,
                     "firmware": device.sw_version,
                     "latest_firmware": latest,

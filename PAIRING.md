@@ -68,9 +68,10 @@ Test vector: code `ABCDE12345FGHJK67890`, dev `0123456789abcdef`, text
 | not paired | known from before 0.6.0 | accepted | accepted unchecked until the code is entered |
 
 Pairing: the user enters the code. Home Assistant derives the key for each
-ring that is waiting and takes the one whose last hello it verifies. If no
-ring fits yet, the code waits for ten minutes (at most four codes) and is
-tried on every hello. An unpaired ring repeats its hello every 30 seconds.
+ring that is waiting and takes the one whose last signed message it
+verifies. If no ring fits yet, the code waits for ten minutes (at most four
+codes) and is tried on every hello, and on every scan of a "not paired"
+ring. An unpaired ring repeats its hello every 30 seconds.
 
 Deleting the ring's device forgets the key.
 

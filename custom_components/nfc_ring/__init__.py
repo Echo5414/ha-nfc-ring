@@ -593,6 +593,14 @@ class RingServer:
         text = None
         if event.mac is not None:
             text = auth.scan_text(event.dev, event.uid, event.sid, event.seq, event.boot, event.n)
+        if ring is not None and ring.key is None and text is not None:
+            # Known from before pairing, and its firmware signs: a scan can
+            # prove an entered code just like a hello does.
+            key = self._key_from_waiting_code(event.dev, text, event.mac)
+            if key is not None:
+                ring = self._pair(event.dev, key)
+            else:
+                ring.candidate = Candidate(text, event.mac, event.boot, event.n)
         if ring is None or (verdict := self._verdict(ring, text, event)) is _Verdict.REJECT:
             _LOGGER.debug("Refusing scan from %s as ring %s: not paired", addr[0], event.dev)
             self._reply(coap.build_ack(msg, coap.CODE_UNAUTHORIZED), addr, local_addr)
