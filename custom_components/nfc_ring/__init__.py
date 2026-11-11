@@ -160,7 +160,7 @@ class PendingRing:
 
     address: str | None
     local: str | None
-    fw: str
+    fw: str  # "" if only a scan was heard so far
     seen: float  # time.time()
     candidate: Candidate | None  # None: firmware too old to pair
     link: str = LINK_THREAD
@@ -469,7 +469,7 @@ class RingServer:
                 raise HomeAssistantError(f"Already {MAX_RINGS} rings; delete one first")
             ring = self.rings[dev] = Ring()
             if known is not None:
-                ring.address, ring.local, ring.fw = known.address, known.local, known.fw
+                ring.address, ring.local, ring.fw = known.address, known.local, known.fw or None
                 ring.link, ring.ble = known.link, known.ble
         ring.key = key
         ring.replay = auth.ReplayWindow()
@@ -758,6 +758,29 @@ class RingServer:
                 ring = self._pair(event.dev, key)
             else:
                 ring.candidate = Candidate(text, event.mac, event.boot, event.n)
+        elif ring is None and text is not None:
+            # Unknown, for example deleted here: it says hello only rarely, so
+            # a signed scan proves an entered code as well, now or later.
+            local = socket.inet_ntop(socket.AF_INET6, local_addr) if local_addr else None
+            heard = self.pending.get(event.dev)
+            known = PendingRing(
+                addr[0],
+                local,
+                heard.fw if heard else "",
+                time.time(),
+                Candidate(text, event.mac, event.boot, event.n),
+            )
+            key = self._key_from_waiting_code(event.dev, text, event.mac)
+            if key is not None:
+                try:
+                    ring = self._pair(event.dev, key, known)
+                except HomeAssistantError as err:
+                    _LOGGER.warning("Cannot pair ring %s: %s", event.dev, err)
+            else:
+                self.pending.pop(event.dev, None)
+                while len(self.pending) >= MAX_PENDING_RINGS:
+                    del self.pending[next(iter(self.pending))]
+                self.pending[event.dev] = known
         if ring is None or (verdict := self._verdict(ring, text, event)) is _Verdict.REJECT:
             _LOGGER.debug("Refusing scan from %s as ring %s: not paired", addr[0], event.dev)
             self._reply(coap.build_ack(msg, coap.CODE_UNAUTHORIZED), addr, local_addr)

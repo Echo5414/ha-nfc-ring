@@ -65,8 +65,9 @@ You can also enter the code first; the ring is then paired as soon as it
 reports (a code waits for ten minutes). With the page switched off, the code
 goes into **Settings → Devices & services → NFC Ring → Configure**.
 
-- **Delete a ring:** open it from the page and choose **⋮ → Delete**. Its
-  key is forgotten; to use it again, enter its code again.
+- **Delete a ring:** press **Delete** in its row on the page, twice. Its
+  key is forgotten; to use it again, enter its code again. The ring is
+  paired again at its next scan or report.
 - **Rings set up before version 0.6.0** keep working and are shown as "Not
   paired". Update their firmware to 0.4.0 or newer, then enter the code. A
   development board prints its code with the shell command `ring code`.
@@ -82,9 +83,8 @@ it last and the automations it triggers.
 - **Hide or show the page:** it is on by default. Untick it when adding the
   integration, or later under **Settings → Devices & services → NFC Ring →
   Configure**. This takes effect at once and changes nothing else.
-- **Deactivate a ring** (lost, lent out): open the ring from the page and
-  choose **⋮ → Disable**. Its scans are then refused until you enable it
-  again.
+- **Deactivate a ring** (lost, lent out): press **Deactivate** in its row.
+  Its scans are then refused until you press **Activate**.
 
 ## Choosing the radio
 

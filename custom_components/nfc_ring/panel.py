@@ -265,6 +265,7 @@ def build_overview(hass: HomeAssistant) -> dict[str, Any]:
             rings.append(
                 {
                     "id": device.id,
+                    "entry": entry.entry_id,
                     "dev": dev,
                     # False: known from before pairing existed, still unsigned.
                     "paired": ring is not None and ring.key is not None,
@@ -281,7 +282,7 @@ def build_overview(hass: HomeAssistant) -> dict[str, Any]:
                     **(_radio(server, dev, ring) if ring is not None else {}),
                 }
             )
-    rings.sort(key=lambda r: (r["name"] or "").lower())
+    rings.sort(key=lambda r: ((r["name"] or "").lower(), r["dev"] or ""))
 
     # Unknown rings that said hello: refused until their code is entered.
     pending = [

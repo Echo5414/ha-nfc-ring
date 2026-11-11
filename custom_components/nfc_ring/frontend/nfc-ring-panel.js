@@ -2,7 +2,8 @@
 // Plain web component, no build step. All data comes from the websocket command
 // nfc_ring/overview; the page reloads it when a tag, automation or update changes.
 // A new ring is paired by entering the code from its packaging (nfc_ring/pair);
-// its radio is chosen in the table (nfc_ring/set_radio).
+// its radio is chosen in the table (nfc_ring/set_radio). A ring is deactivated
+// or deleted through Home Assistant's device registry, like on its device page.
 
 const TEXT = {
   en: {
@@ -48,7 +49,15 @@ const TEXT = {
     createAutomation: "Create",
     off: "off",
     manageTags: "Manage tags",
-    ringHint: "Select a ring to rename, deactivate or delete it. A deactivated ring's scans are ignored; a deleted ring needs its code again.",
+    ringHint: "A deactivated ring's scans are ignored. A deleted ring needs its code again. Select a ring's name to rename it.",
+    actions: "Actions",
+    deactivate: "Deactivate",
+    activate: "Activate",
+    remove: "Delete",
+    removeSure: "Really delete?",
+    removed: "The ring is deleted. To use it again, enter its code.",
+    actionFailed: "That did not work: {e}",
+    deletedRing: "deleted ring",
     error: "The overview could not be loaded.",
     radio: "Radio",
     radioThread: "Thread",
@@ -104,7 +113,15 @@ const TEXT = {
     createAutomation: "Anlegen",
     off: "aus",
     manageTags: "Tags verwalten",
-    ringHint: "Ring anklicken, um ihn umzubenennen, zu deaktivieren oder zu löschen. Scans eines deaktivierten Rings werden ignoriert; ein gelöschter Ring braucht seinen Code erneut.",
+    ringHint: "Scans eines deaktivierten Rings werden ignoriert. Ein gelöschter Ring braucht seinen Code erneut. Zum Umbenennen den Namen anklicken.",
+    actions: "Aktionen",
+    deactivate: "Deaktivieren",
+    activate: "Aktivieren",
+    remove: "Löschen",
+    removeSure: "Wirklich löschen?",
+    removed: "Der Ring ist gelöscht. Um ihn wieder zu nutzen, seinen Code eingeben.",
+    actionFailed: "Das hat nicht geklappt: {e}",
+    deletedRing: "gelöschter Ring",
     error: "Die Übersicht konnte nicht geladen werden.",
     radio: "Funkart",
     radioThread: "Thread",
@@ -283,6 +300,50 @@ class NfcRingPanel extends HTMLElement {
     await this._load();
   }
 
+  // Deactivate, activate or delete a ring: what its device page does too.
+  async _ringAction(id, action) {
+    const t = this._t;
+    const ring = this._data?.rings.find((r) => r.id === id);
+    if (!ring || this._ringBusy) return;
+    if (action === "remove" && this._sure !== id) {
+      // First click only arms the button; it disarms by itself.
+      this._sure = id;
+      clearTimeout(this._sureTimer);
+      this._sureTimer = setTimeout(() => {
+        this._sure = null;
+        this._render();
+      }, 6000);
+      this._render();
+      return;
+    }
+    clearTimeout(this._sureTimer);
+    this._sure = null;
+    this._ringBusy = true;
+    this._radioMsg = null;
+    try {
+      if (action === "remove") {
+        await this._hass.callWS({
+          type: "config/device_registry/remove_config_entry",
+          device_id: id,
+          config_entry_id: ring.entry,
+        });
+        this._radioMsg = { kind: "ok", text: t.removed };
+      } else {
+        await this._hass.callWS({
+          type: "config/device_registry/update",
+          device_id: id,
+          disabled_by: action === "deactivate" ? "user" : null,
+        });
+      }
+    } catch (err) {
+      this._radioMsg = { kind: "err", text: t.actionFailed.replace("{e}", err?.message || "?") };
+    } finally {
+      this._ringBusy = false;
+    }
+    await this._load();
+    this._render();
+  }
+
   _radioCell(r) {
     const t = this._t;
     const names = { thread: t.radioThread, bluetooth: t.radioBluetooth, zigbee: t.radioZigbee };
@@ -340,6 +401,10 @@ class NfcRingPanel extends HTMLElement {
           <td data-l="${t.firmware}"><div>${fw}</div></td>
           <td data-l="${t.lastScan}"><div>${this._when(r.last_scan)}</div></td>
           <td data-l="${t.id}" class="mono"><div>${esc(r.dev || "–")}</div></td>
+          <td data-l="${t.actions}"><div class="acts">
+            <button type="button" class="act" data-id="${esc(r.id)}" data-act="${r.disabled ? "activate" : "deactivate"}">${r.disabled ? t.activate : t.deactivate}</button>
+            <button type="button" class="act danger${this._sure === r.id ? " sure" : ""}" data-id="${esc(r.id)}" data-act="remove">${this._sure === r.id ? t.removeSure : t.remove}</button>
+          </div></td>
         </tr>`;
     });
     // Rings that reported but are refused until their code is entered.
@@ -355,6 +420,7 @@ class NfcRingPanel extends HTMLElement {
           <td data-l="${t.firmware}"><div>${esc(p.firmware || "–")}</div></td>
           <td data-l="${t.lastScan}"><div><span class="muted">–</span></div></td>
           <td data-l="${t.id}" class="mono"><div>${esc(p.dev)}</div></td>
+          <td data-l="${t.actions}"><div><span class="muted">–</span></div></td>
         </tr>`;
     });
     return known.concat(waiting).join("");
@@ -390,9 +456,12 @@ class NfcRingPanel extends HTMLElement {
               })
               .join("")
           : `<span class="muted">${t.noAutomation}</span>`;
-        const ring = tag.device_id
-          ? `<a href="/config/devices/device/${esc(tag.device_id)}">${esc(tag.device_name || tag.device_id)}</a>`
-          : `<span class="muted">–</span>`;
+        // A ring that was deleted since has no name and no page any more.
+        const ring = !tag.device_id
+          ? `<span class="muted">–</span>`
+          : tag.device_name
+            ? `<a href="/config/devices/device/${esc(tag.device_id)}">${esc(tag.device_name)}</a>`
+            : `<span class="muted">${t.deletedRing}</span>`;
         return `<tr>
           <td data-l="${t.name}"><div>${esc(tag.name)}</div></td>
           <td data-l="${t.id}" class="mono"><div>${esc(tag.id)}</div></td>
@@ -416,7 +485,7 @@ class NfcRingPanel extends HTMLElement {
       const pending = data.pending || [];
       const rings = data.rings.length + pending.length
         ? `<div class="scroll"><table>
-            <thead><tr><th>${t.name}</th><th>${t.status}</th><th>${t.pairing}</th><th>${t.radio}</th><th>${t.firmware}</th><th>${t.lastScan}</th><th>${t.id}</th></tr></thead>
+            <thead><tr><th>${t.name}</th><th>${t.status}</th><th>${t.pairing}</th><th>${t.radio}</th><th>${t.firmware}</th><th>${t.lastScan}</th><th>${t.id}</th><th>${t.actions}</th></tr></thead>
             <tbody>${this._ringRows(data.rings, pending)}</tbody></table></div>
            ${this._radioMsg ? `<p class="msg ${this._radioMsg.kind}">${esc(this._radioMsg.text)}</p>` : ""}
            ${data.rings.length ? `<p class="hint">${t.ringHint}</p>` : ""}`
@@ -469,6 +538,9 @@ class NfcRingPanel extends HTMLElement {
       });
       this.shadowRoot.querySelector("#scan")?.addEventListener("click", () => this._scan());
     }
+    this.shadowRoot.querySelectorAll("button.act").forEach((button) =>
+      button.addEventListener("click", () => this._ringAction(button.dataset.id, button.dataset.act))
+    );
     this.shadowRoot.querySelectorAll("select.radio").forEach((select) => {
       select.addEventListener("change", () => {
         select.blur();
@@ -535,6 +607,12 @@ const STYLE = `
   .pair button { height: 40px; padding: 0 18px; font: inherit; font-weight: 500; cursor: pointer; border: none; border-radius: 8px;
                  color: var(--text-primary-color, #fff); background: var(--primary-color); }
   .pair button.second { color: var(--primary-color); background: none; border: 1px solid var(--primary-color); }
+  .acts { display: flex; flex-wrap: wrap; gap: 6px; }
+  button.act { font: inherit; font-size: 13px; font-weight: 500; height: 30px; padding: 0 10px; cursor: pointer; white-space: nowrap;
+               color: var(--primary-color); background: none; border: 1px solid var(--divider-color, #e0e0e0); border-radius: 8px; }
+  button.act.danger { color: var(--error-color, #c62828); }
+  button.act.sure { color: #fff; background: var(--error-color, #c62828); border-color: var(--error-color, #c62828); }
+  button.act:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 1px; }
   select.radio { font: inherit; height: 32px; padding: 0 6px; color: var(--primary-text-color);
                  background: var(--secondary-background-color); border: 1px solid var(--divider-color, #e0e0e0); border-radius: 8px; }
   select.radio:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 1px; }
