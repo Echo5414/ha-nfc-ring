@@ -3,11 +3,28 @@
     "step": {
       "user": {
         "title": "NFC Ring",
-        "description": "Empfängt Scans von NFC-Ringen im Thread-Netzwerk (UDP-Port 5683) und meldet sie als Tag-Scans. Gescannte Tags erscheinen unter Einstellungen → Tags."
+        "description": "Empfängt Scans von NFC-Ringen im Thread-Netzwerk (UDP-Port 5683) und meldet sie als Tag-Scans. Gescannte Tags erscheinen unter Einstellungen → Tags.",
+        "data": {
+          "show_panel": "Übersichtsseite „NFC Ring“ in der Seitenleiste anzeigen"
+        },
+        "data_description": {
+          "show_panel": "Zeigt Ringe, Tags und die zugehörigen Automationen. Lässt sich jederzeit unter „Konfigurieren“ ändern."
+        }
       }
     },
     "abort": {
       "single_instance_allowed": "NFC Ring ist bereits eingerichtet."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "NFC Ring",
+        "description": "Die Übersichtsseite zeigt Ringe, Tags und die zugehörigen Automationen. Abschalten entfernt nur den Eintrag in der Seitenleiste.",
+        "data": {
+          "show_panel": "Übersichtsseite „NFC Ring“ in der Seitenleiste anzeigen"
+        }
+      }
     }
   }
 }

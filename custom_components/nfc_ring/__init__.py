@@ -40,7 +40,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 
-from . import coap, firmware as fw
+from . import coap, firmware as fw, panel
 from .const import (
     DOMAIN,
     FIRMWARE_DIR,
@@ -129,6 +129,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: NfcRingConfigEntry) -> b
         raise
 
     entry.runtime_data = server
+    await panel.async_setup(hass)
+    panel.async_apply(hass, entry)
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     entry.async_on_unload(
         async_track_time_interval(hass, server.async_scan_firmware, _FIRMWARE_SCAN_INTERVAL)
     )
@@ -139,10 +142,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: NfcRingConfigEntry) -> b
     return True
 
 
+async def _async_options_updated(hass: HomeAssistant, entry: NfcRingConfigEntry) -> None:
+    """The only option is the sidebar page; no reload needed."""
+    panel.async_apply(hass, entry)
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: NfcRingConfigEntry) -> bool:
     """Stop listening."""
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
+        panel.async_remove(hass)
         entry.runtime_data.close()
     return unloaded
 
@@ -405,6 +414,12 @@ class RingServer:
             return
 
         if not self._ring_seen(event.dev, addr, local_addr):
+            self._reply(coap.build_ack(msg, coap.CODE_FORBIDDEN), addr, local_addr)
+            return
+
+        if self._ensure_device(event.dev).disabled:
+            # Deactivated in Home Assistant (device page): its scans do nothing.
+            _LOGGER.debug("Ignoring scan from deactivated ring %s", event.dev)
             self._reply(coap.build_ack(msg, coap.CODE_FORBIDDEN), addr, local_addr)
             return
 

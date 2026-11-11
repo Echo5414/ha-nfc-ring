@@ -13,6 +13,9 @@ FIRMWARE_DIR = "nfc_ring_firmware"
 # GitHub repository whose latest release carries the newest ring firmware.
 FIRMWARE_REPOSITORY = "Echo5414/nfc-ring-releases"
 
+# Option: show the overview page in the sidebar (default: yes).
+CONF_SHOW_PANEL = "show_panel"
+
 # Dispatcher signals
 SIGNAL_RING_ADDED = f"{DOMAIN}_ring_added"
 SIGNAL_RING_CHANGED = f"{DOMAIN}_ring_changed"  # argument: device id

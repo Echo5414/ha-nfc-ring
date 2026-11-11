@@ -33,6 +33,20 @@ and keeps the ring's firmware up to date.
 Every ring shows up as its own device ("NFC Ring 630E"), and automations can
 tell which ring scanned a tag.
 
+## Overview page
+
+The integration adds an **NFC Ring** page to the sidebar. It lists every
+ring (status, firmware, last scan) and every tag with the ring that scanned
+it last and the automations it triggers.
+
+- **Hide or show the page:** it is on by default. Untick it when adding the
+  integration, or later under **Settings → Devices & services → NFC Ring →
+  Configure**. This takes effect at once and changes nothing else.
+- **Deactivate a ring** (lost, lent out): open the ring from the page and
+  choose **⋮ → Disable**. Its scans are then refused until you enable it
+  again. Read the security note below: this is not yet a protection against
+  a forged ring.
+
 ## Firmware updates
 
 New ring firmware appears under **Settings → Updates** like any other
