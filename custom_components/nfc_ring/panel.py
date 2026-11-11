@@ -1,13 +1,15 @@
 """Overview page in the sidebar: the rings, the tags and what each tag triggers.
 
 The page is a small web component (frontend/nfc-ring-panel.js) that asks for
-everything it shows with one websocket command, nfc_ring/overview. It can be
-switched off in the integration's options; nothing else depends on it.
+everything it shows with one websocket command, nfc_ring/overview, and pairs
+a ring with nfc_ring/pair. It can be switched off in the integration's
+options; a ring can then still be paired there.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,7 @@ from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.loader import async_get_integration
 
@@ -44,6 +47,7 @@ async def async_setup(hass: HomeAssistant) -> None:
         [StaticPathConfig(_STATIC_URL, str(_STATIC_DIR), cache_headers=False)]
     )
     websocket_api.async_register_command(hass, _ws_overview)
+    websocket_api.async_register_command(hass, _ws_pair)
 
 
 @callback
@@ -83,6 +87,37 @@ def _ws_overview(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> None:
     connection.send_result(msg["id"], build_overview(hass))
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/pair", vol.Required("code"): str}
+)
+@websocket_api.require_admin
+@callback
+def _ws_pair(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Pairs the ring whose code was entered; "waiting" if it has not said hello yet."""
+    server = _server(hass)
+    if server is None:
+        connection.send_error(msg["id"], "not_loaded", "NFC Ring is not running")
+        return
+    try:
+        dev = server.async_pair(msg["code"])
+    except ValueError:
+        connection.send_error(msg["id"], "invalid_code", "This is not a pairing code")
+        return
+    except HomeAssistantError as err:
+        connection.send_error(msg["id"], "failed", str(err))
+        return
+    connection.send_result(msg["id"], {"status": "paired" if dev else "waiting", "dev": dev})
+
+
+@callback
+def _server(hass: HomeAssistant):
+    for entry in hass.config_entries.async_loaded_entries(DOMAIN):
+        return entry.runtime_data
+    return None
 
 
 def _as_list(value: Any) -> list:
@@ -157,6 +192,9 @@ def build_overview(hass: HomeAssistant) -> dict[str, Any]:
         )
     tags.sort(key=lambda t: (t["last_scanned"] is not None, t["last_scanned"] or ""), reverse=True)
 
+    server = _server(hass)
+    known = server.rings if server else {}
+
     rings: list[dict[str, Any]] = []
     for entry in hass.config_entries.async_entries(DOMAIN):
         for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
@@ -168,9 +206,16 @@ def build_overview(hass: HomeAssistant) -> dict[str, Any]:
                 if (state := hass.states.get(ent.entity_id)) is not None:
                     update_available = state.state == STATE_ON
                     latest = state.attributes.get("latest_version")
+            dev = next((i for domain, i in device.identifiers if domain == DOMAIN), None)
+            ring = known.get(dev)
             rings.append(
                 {
                     "id": device.id,
+                    "dev": dev,
+                    # False: known from before pairing existed, still unsigned.
+                    "paired": ring is not None and ring.key is not None,
+                    # Its firmware signs, so entering the code is all it takes.
+                    "can_pair": ring is not None and ring.candidate is not None,
                     "name": device.name_by_user or device.name,
                     "firmware": device.sw_version,
                     "latest_firmware": latest,
@@ -181,4 +226,21 @@ def build_overview(hass: HomeAssistant) -> dict[str, Any]:
             )
     rings.sort(key=lambda r: (r["name"] or "").lower())
 
-    return {"rings": rings, "tags": tags}
+    # Unknown rings that said hello: refused until their code is entered.
+    pending = [
+        {
+            "dev": dev,
+            "firmware": p.fw,
+            "can_pair": p.candidate is not None,
+            "seen": datetime.fromtimestamp(p.seen, UTC).isoformat(),
+        }
+        for dev, p in (server.pending if server else {}).items()
+    ]
+    pending.sort(key=lambda p: p["seen"], reverse=True)
+
+    return {
+        "rings": rings,
+        "pending": pending,
+        "waiting": bool(server and server.waiting_for_ring),
+        "tags": tags,
+    }

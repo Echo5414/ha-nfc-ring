@@ -39,18 +39,40 @@ and keeps the ring's firmware up to date.
 
 ## Using it
 
-1. Hold the ring to an NFC sticker. The sticker appears under
+1. Pair the ring (next section).
+2. Hold the ring to an NFC sticker. The sticker appears under
    **Settings → Tags** the first time it is scanned.
-2. Give it a name, then **⋮ → Create automation** and pick what should
+3. Give it a name, then **⋮ → Create automation** and pick what should
    happen.
 
 Every ring shows up as its own device ("NFC Ring 630E"), and automations can
 tell which ring scanned a tag.
 
+## Pairing a ring
+
+A ring only triggers anything after it was paired with its code: 20
+characters, printed on its packaging (`XXXXX-XXXXX-XXXXX-XXXXX`).
+
+1. Switch the ring on. Once it is on your Thread network it shows up on the
+   **NFC Ring** page as "New ring … – Waiting for code".
+2. Enter the code under **Add a ring** and press **Pair ring**.
+
+You can also enter the code first; the ring is then paired as soon as it
+reports (a code waits for ten minutes). With the page switched off, the code
+goes into **Settings → Devices & services → NFC Ring → Configure**.
+
+- **Delete a ring:** open it from the page and choose **⋮ → Delete**. Its
+  key is forgotten; to use it again, enter its code again.
+- **Rings set up before version 0.6.0** keep working and are shown as "Not
+  paired". Update their firmware to 0.4.0 or newer, then enter the code. A
+  development board prints its code with the shell command `ring code`.
+- Home Assistant stores the ring keys in `.storage/nfc_ring.rings`. They are
+  part of your backups, so keep those private.
+
 ## Overview page
 
 The integration adds an **NFC Ring** page to the sidebar. It lists every
-ring (status, firmware, last scan) and every tag with the ring that scanned
+ring (status, pairing, firmware, last scan) and every tag with the ring that scanned
 it last and the automations it triggers.
 
 - **Hide or show the page:** it is on by default. Untick it when adding the
@@ -58,8 +80,7 @@ it last and the automations it triggers.
   Configure**. This takes effect at once and changes nothing else.
 - **Deactivate a ring** (lost, lent out): open the ring from the page and
   choose **⋮ → Disable**. Its scans are then refused until you enable it
-  again. Read the security note below: this is not yet a protection against
-  a forged ring.
+  again.
 
 ## Firmware updates
 
@@ -77,11 +98,22 @@ Releases come from
 To try your own build, put the signed `.bin` into
 `/config/nfc_ring_firmware/`; the highest version there or on GitHub wins.
 
-## Security note
+## Security
 
-This is a prototype. Scans and ring announcements are not authenticated
-yet: a device on your network could fake a tag scan. Do not use it for door
-locks or alarm systems until pairing with per-ring keys is available.
+This is a prototype; do not use it for door locks or alarm systems yet.
+
+- Every message of a paired ring is signed with a key derived from its
+  pairing code, and numbered. A forged, changed or recorded-and-replayed
+  scan is refused. Update notices to the ring are signed the same way.
+- Messages are signed, not encrypted: someone who knows your Thread network
+  key can see which tag a ring scanned.
+- A ring shown as "Not paired" is not protected: anyone on your network
+  could fake its scans. Pair it or delete it.
+- The code is the secret. Whoever has it and is on your network can pair as
+  that ring.
+
+The protocol is described in
+[PAIRING.md](PAIRING.md).
 
 ## How it works
 
@@ -93,3 +125,8 @@ The integration listens on UDP port 5683 (CoAP) of the Home Assistant host.
 | ring → HA | `POST /hello` | firmware version, after joining and hourly |
 | HA → ring | `POST /dfu` | an update is available |
 | ring → HA | `GET /fw/<ring>` | download the update, 512-byte blocks |
+
+From firmware 0.4.0 on, `/nfc` and `/hello` carry `boot`, `n` and `mac`,
+and `/dfu` carries `mac`; see [PAIRING.md](PAIRING.md). `tools/ringsim.py`
+plays a ring without hardware, `tools/ringcheck.py` checks a real ring's
+signatures, and `python3 -m unittest discover -s tests` runs the tests.

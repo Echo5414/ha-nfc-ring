@@ -34,6 +34,8 @@ async def async_setup_entry(
 
     @callback
     def add_new_rings() -> None:
+        # A deleted ring gets a new entity when it is paired again.
+        added.intersection_update(server.rings)
         new = [dev for dev in server.rings if dev not in added]
         added.update(new)
         async_add_entities(RingFirmwareUpdate(server, dev) for dev in new)
@@ -76,7 +78,8 @@ class RingFirmwareUpdate(UpdateEntity):
 
     @property
     def installed_version(self) -> str | None:
-        return self._server.rings[self._dev].fw
+        ring = self._server.rings.get(self._dev)
+        return ring.fw if ring else None
 
     @property
     def latest_version(self) -> str | None:

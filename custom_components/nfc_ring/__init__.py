@@ -13,8 +13,12 @@ block-wise (GET /fw/<device id>) and restarts.
 MCUboot on the ring only boots images signed with our key, and a new image
 that never reaches Home Assistant is rolled back by the ring itself.
 
-Scans and hellos are not authenticated yet: any host that can reach this
-port can report a tag scan or announce a ring (at most MAX_RINGS of them).
+Pairing: a ring only counts once its pairing code (printed on its packaging)
+was entered here. From then on each of its messages must carry a valid
+signature and a fresh counter (see auth.py), and it only accepts update
+notices signed by us. Rings that were already known before pairing existed
+and still run firmware older than 0.4.0 keep working unsigned until they are
+updated and paired; the overview page marks them.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
+from enum import Enum, auto
 import logging
 import os
 from pathlib import Path
@@ -40,7 +45,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 
-from . import coap, firmware as fw, panel
+from . import auth, coap, firmware as fw, panel
 from .const import (
     DOMAIN,
     FIRMWARE_DIR,
@@ -55,9 +60,15 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.UPDATE]
 
-# Until rings are paired with a key, this bounds how many devices bogus
-# hellos or scans can create.
 MAX_RINGS = 16
+
+# Unknown rings that said hello and wait for their code. Kept in memory only;
+# anyone on the network can fill this list, so it is small and never stored.
+MAX_PENDING_RINGS = 16
+
+# A code that matched no ring yet is tried on the next hellos for this long.
+_CODE_WAIT_SECONDS = 600
+_MAX_WAITING_CODES = 4
 
 # struct in6_pktinfo: 16-byte address + 4-byte interface index
 _PKTINFO_SIZE = 20
@@ -95,11 +106,42 @@ type NfcRingConfigEntry = ConfigEntry[RingServer]
 
 
 @dataclass
+class Candidate:
+    """A signed hello of an unpaired ring, kept to check a pairing code against."""
+
+    text: str
+    mac: str
+    boot: int
+    n: int
+
+
+@dataclass
 class Ring:
     address: str | None = None  # the ring's last source IPv6 address
     local: str | None = None  # our address the ring talks to (its "server")
     fw: str | None = None  # firmware version from the last hello
     sid: int | None = None  # boot session from the last hello
+    # None: known from before pairing existed and not paired yet.
+    key: bytes | None = None
+    replay: auth.ReplayWindow = field(default_factory=auth.ReplayWindow)
+    candidate: Candidate | None = None  # only while unpaired
+
+
+@dataclass
+class PendingRing:
+    """An unknown ring that said hello; it is refused until its code is entered."""
+
+    address: str
+    local: str | None
+    fw: str
+    seen: float  # time.time()
+    candidate: Candidate | None  # None: firmware too old to pair
+
+
+class _Verdict(Enum):
+    FRESH = auto()  # act on it
+    REPEAT = auto()  # a copy of a message already acted on
+    REJECT = auto()  # unsigned, wrongly signed or too old
 
 
 @dataclass
@@ -147,6 +189,23 @@ async def _async_options_updated(hass: HomeAssistant, entry: NfcRingConfigEntry)
     panel.async_apply(hass, entry)
 
 
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: NfcRingConfigEntry, device: dr.DeviceEntry
+) -> bool:
+    """Delete on the device page: forgets the ring and its key.
+
+    The ring is then refused like any unknown one until its code is entered
+    again.
+    """
+    server = entry.runtime_data
+    devs = [dev for domain, dev in device.identifiers if domain == DOMAIN]
+    if any(dev in server.updates for dev in devs):
+        return False
+    for dev in devs:
+        server.forget_ring(dev)
+    return True
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: NfcRingConfigEntry) -> bool:
     """Stop listening."""
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
@@ -172,6 +231,8 @@ class RingServer:
         self.entry = entry
         self.duplicates = coap.DuplicateFilter()
         self.rings: dict[str, Ring] = {}
+        self.pending: dict[str, PendingRing] = {}  # oldest first
+        self._codes: dict[str, float] = {}  # entered code -> time.monotonic() it expires
         self.firmware: fw.Firmware | None = None  # newest of local and release
         self._local_firmware: fw.Firmware | None = None
         self._release_firmware: fw.Firmware | None = None
@@ -179,7 +240,9 @@ class RingServer:
         # Serializes scans, GitHub checks and release downloads.
         self._firmware_lock = asyncio.Lock()
         self.updates: dict[str, UpdateSession] = {}
-        self._store: Store[dict[str, dict]] = Store(hass, _STORAGE_VERSION, f"{DOMAIN}.rings")
+        self._store: Store[dict[str, dict]] = Store(
+            hass, _STORAGE_VERSION, f"{DOMAIN}.rings", private=True  # holds the ring keys
+        )
         # mid -> (peer address, token, response code future)
         self._requests: dict[int, tuple[str, bytes, asyncio.Future[int]]] = {}
         self._next_mid = random.randrange(0x10000)
@@ -199,9 +262,23 @@ class RingServer:
         stored = await self._store.async_load() or {}
         for dev, data in list(stored.items())[:MAX_RINGS]:
             # A ring heard while loading is newer than what was stored.
-            self.rings.setdefault(
-                dev, Ring(address=data.get("address"), local=data.get("local"), fw=data.get("fw"))
+            ring = Ring(
+                address=data.get("address"),
+                local=data.get("local"),
+                fw=data.get("fw"),
+                sid=data.get("sid"),
             )
+            try:
+                if data.get("key"):
+                    ring.key = bytes.fromhex(data["key"])
+                    ring.replay = auth.ReplayWindow(
+                        int(data["boot"]), int(data["top"]), int(data["mask"], 16)
+                    )
+            except (KeyError, TypeError, ValueError):
+                # Without its counters a key would accept replays: pair again.
+                _LOGGER.error("Stored pairing of ring %s is damaged; pair it again", dev)
+                ring.key = None
+            self.rings.setdefault(dev, ring)
         # GitHub is checked in the background once setup is done.
         await self.async_scan_firmware(skip_release_check=True)
 
@@ -219,16 +296,9 @@ class RingServer:
     @callback
     def _ring_seen(
         self, dev: str, addr: tuple, local_addr: bytes | None, hello: coap.Hello | None = None
-    ) -> bool:
-        """Records where a ring is; False if it is unknown and there is no room."""
-        ring = self.rings.get(dev)
-        added = ring is None
-        if added:
-            if len(self.rings) >= MAX_RINGS:
-                _LOGGER.warning("Ignoring ring %s: already %d rings known", dev, MAX_RINGS)
-                return False
-            ring = self.rings[dev] = Ring()
-
+    ) -> None:
+        """Records where a known ring is and, from a hello, what it runs."""
+        ring = self.rings[dev]
         before = (ring.address, ring.local, ring.fw)
         ring.address = addr[0]
         if local_addr:
@@ -238,20 +308,126 @@ class RingServer:
             ring.sid = hello.sid
 
         self._ensure_device(dev)
+        self._store.async_delay_save(self._stored_rings, _STORAGE_SAVE_DELAY)
         if (ring.address, ring.local, ring.fw) != before:
-            self._store.async_delay_save(self._stored_rings, _STORAGE_SAVE_DELAY)
-            if not added:
-                async_dispatcher_send(self.hass, SIGNAL_RING_CHANGED, dev)
-        if added:
-            async_dispatcher_send(self.hass, SIGNAL_RING_ADDED)
-        return True
+            async_dispatcher_send(self.hass, SIGNAL_RING_CHANGED, dev)
 
     @callback
     def _stored_rings(self) -> dict[str, dict]:
-        return {
-            dev: {"address": r.address, "local": r.local, "fw": r.fw}
+        stored = {}
+        for dev, ring in self.rings.items():
+            data: dict = {
+                "address": ring.address,
+                "local": ring.local,
+                "fw": ring.fw,
+                "sid": ring.sid,
+            }
+            if ring.key is not None:
+                data |= {
+                    "key": ring.key.hex(),
+                    "boot": ring.replay.boot,
+                    "top": ring.replay.top,
+                    "mask": f"{ring.replay.mask:x}",
+                }
+            stored[dev] = data
+        return stored
+
+    # Pairing
+
+    @callback
+    def _verdict(
+        self, ring: Ring, text: str | None, message: coap.ScanEvent | coap.Hello
+    ) -> _Verdict:
+        """Checks a known ring's message; the caller accepts what is FRESH."""
+        if ring.key is None:
+            return _Verdict.FRESH
+        if text is None or not auth.verify(ring.key, text, message.mac):
+            return _Verdict.REJECT
+        freshness = ring.replay.check(message.boot, message.n)
+        if freshness is auth.Freshness.OLD:
+            return _Verdict.REJECT
+        return _Verdict.REPEAT if freshness is auth.Freshness.SEEN else _Verdict.FRESH
+
+    @callback
+    def _pair(self, dev: str, key: bytes, known: PendingRing | None = None) -> Ring:
+        ring = self.rings.get(dev)
+        added = ring is None
+        if added:
+            if len(self.rings) >= MAX_RINGS:
+                raise HomeAssistantError(f"Already {MAX_RINGS} rings; delete one first")
+            ring = self.rings[dev] = Ring()
+            if known is not None:
+                ring.address, ring.local, ring.fw = known.address, known.local, known.fw
+        ring.key = key
+        ring.replay = auth.ReplayWindow()
+        ring.candidate = None
+        self.pending.pop(dev, None)
+
+        self._ensure_device(dev)
+        self._store.async_delay_save(self._stored_rings, 0)
+        async_dispatcher_send(
+            self.hass, *((SIGNAL_RING_ADDED,) if added else (SIGNAL_RING_CHANGED, dev))
+        )
+        _LOGGER.info("Ring %s is paired", dev)
+        return ring
+
+    @callback
+    def async_pair(self, text: str) -> str | None:
+        """Pairs the ring a code belongs to.
+
+        Returns its device id, or None if no ring that said hello fits: the
+        code then stays valid for a few minutes and is tried on every hello.
+        Raises ValueError if text cannot be a code.
+        """
+        code = auth.normalize_code(text)
+        if code is None:
+            raise ValueError("not a pairing code")
+
+        waiting: list[tuple[str, Candidate, PendingRing | None]] = [
+            (dev, p.candidate, p) for dev, p in self.pending.items() if p.candidate
+        ]
+        waiting += [
+            (dev, r.candidate, None)
             for dev, r in self.rings.items()
-        }
+            if r.key is None and r.candidate
+        ]
+        for dev, candidate, known in waiting:
+            key = auth.derive_key(code, dev)
+            if auth.verify(key, candidate.text, candidate.mac):
+                ring = self._pair(dev, key, known)
+                # The hello that proved the code is used up.
+                ring.replay.accept(candidate.boot, candidate.n)
+                return dev
+
+        self._codes.pop(code, None)
+        while len(self._codes) >= _MAX_WAITING_CODES:
+            del self._codes[next(iter(self._codes))]
+        self._codes[code] = time.monotonic() + _CODE_WAIT_SECONDS
+        return None
+
+    @property
+    def waiting_for_ring(self) -> bool:
+        """True while an entered code waits for its ring to say hello."""
+        now = time.monotonic()
+        return any(expires > now for expires in self._codes.values())
+
+    @callback
+    def _key_from_waiting_code(self, dev: str, text: str, mac: str) -> bytes | None:
+        now = time.monotonic()
+        for code, expires in list(self._codes.items()):
+            if expires <= now:
+                del self._codes[code]
+                continue
+            key = auth.derive_key(code, dev)
+            if auth.verify(key, text, mac):
+                del self._codes[code]
+                return key
+        return None
+
+    @callback
+    def forget_ring(self, dev: str) -> None:
+        if self.rings.pop(dev, None) is not None:
+            self._store.async_delay_save(self._stored_rings, 0)
 
     @callback
     def _ensure_device(self, dev: str) -> dr.DeviceEntry:
@@ -413,10 +589,27 @@ class RingServer:
             self._reply(coap.build_ack(msg, coap.CODE_BAD_REQUEST), addr, local_addr)
             return
 
-        if not self._ring_seen(event.dev, addr, local_addr):
-            self._reply(coap.build_ack(msg, coap.CODE_FORBIDDEN), addr, local_addr)
+        ring = self.rings.get(event.dev)
+        text = None
+        if event.mac is not None:
+            text = auth.scan_text(event.dev, event.uid, event.sid, event.seq, event.boot, event.n)
+        if ring is None or (verdict := self._verdict(ring, text, event)) is _Verdict.REJECT:
+            _LOGGER.debug("Refusing scan from %s as ring %s: not paired", addr[0], event.dev)
+            self._reply(coap.build_ack(msg, coap.CODE_UNAUTHORIZED), addr, local_addr)
             return
 
+        if verdict is _Verdict.REPEAT:
+            # The same signed message again. Only a retransmission of a scan
+            # we still track is answered; anything else is a replay.
+            state = self.duplicates.peek(event.key)
+            if state is coap.ScanState.DONE:
+                self._reply(coap.build_ack(msg, coap.CODE_CHANGED), addr, local_addr)
+            elif state is None:
+                self._reply(coap.build_ack(msg, coap.CODE_UNAUTHORIZED), addr, local_addr)
+            return
+
+        # Only a fresh message may move the ring to a new address.
+        self._ring_seen(event.dev, addr, local_addr)
         if self._ensure_device(event.dev).disabled:
             # Deactivated in Home Assistant (device page): its scans do nothing.
             _LOGGER.debug("Ignoring scan from deactivated ring %s", event.dev)
@@ -424,20 +617,31 @@ class RingServer:
             return
 
         state = self.duplicates.admit(event.key)
+        if state is coap.ScanState.FULL:
+            _LOGGER.debug("Too many scans in flight, refusing scan from %s", addr[0])
+            self._reply(coap.build_ack(msg, coap.CODE_SERVICE_UNAVAILABLE), addr, local_addr)
+            return
+        if state is coap.ScanState.PENDING:
+            # Still recording the first copy; the ring retries and gets the
+            # real result then.
+            return
+        if ring.key is not None:
+            ring.replay.accept(event.boot, event.n)
         if state is coap.ScanState.DONE:
             # Retransmission: the ring missed our first reply.
             self._reply(coap.build_ack(msg, coap.CODE_CHANGED), addr, local_addr)
-        elif state is coap.ScanState.PENDING:
-            # Still recording the first copy; the ring retries and gets the
-            # real result then.
-            pass
-        elif state is coap.ScanState.FULL:
-            _LOGGER.debug("Too many scans in flight, refusing scan from %s", addr[0])
-            self._reply(coap.build_ack(msg, coap.CODE_SERVICE_UNAVAILABLE), addr, local_addr)
         else:
             self.entry.async_create_background_task(
                 self.hass, self._handle_scan(msg, event, addr, local_addr), f"{DOMAIN} scan"
             )
+
+    @callback
+    def _retry_allowed(self, event: coap.ScanEvent) -> None:
+        """After a failed scan: lets the ring's retransmission try again."""
+        self.duplicates.forget(event.key)
+        ring = self.rings.get(event.dev)
+        if ring is not None and ring.key is not None and event.n is not None:
+            ring.replay.release(event.boot, event.n)
 
     async def _handle_scan(
         self, msg: coap.CoapMessage, event: coap.ScanEvent, addr: tuple, local_addr: bytes | None
@@ -447,12 +651,12 @@ class RingServer:
             await async_scan_tag(self.hass, event.uid, device.id)
         except HomeAssistantError as err:
             _LOGGER.error("Could not record scan of tag %s: %s", event.uid, err)
-            self.duplicates.forget(event.key)
+            self._retry_allowed(event)
             self._reply(coap.build_ack(msg, coap.CODE_INTERNAL_ERROR), addr, local_addr)
             return
         except BaseException:
             # Includes cancellation on unload: let a retransmission try again.
-            self.duplicates.forget(event.key)
+            self._retry_allowed(event)
             raise
 
         self.duplicates.finish(event.key)
@@ -467,9 +671,48 @@ class RingServer:
             self._reply(coap.build_ack(msg, coap.CODE_BAD_REQUEST), addr, local_addr)
             return
 
-        if not self._ring_seen(hello.dev, addr, local_addr, hello):
-            self._reply(coap.build_ack(msg, coap.CODE_FORBIDDEN), addr, local_addr)
+        ring = self.rings.get(hello.dev)
+        local = socket.inet_ntop(socket.AF_INET6, local_addr) if local_addr else None
+        text = candidate = None
+        if hello.mac is not None:
+            text = auth.hello_text(
+                hello.dev, hello.fw, hello.sid, hello.confirmed, hello.boot, hello.n
+            )
+            candidate = Candidate(text, hello.mac, hello.boot, hello.n)
+
+        if (ring is None or ring.key is None) and text is not None:
+            # Its code may have been entered before the ring was heard.
+            key = self._key_from_waiting_code(hello.dev, text, hello.mac)
+            if key is not None:
+                try:
+                    ring = self._pair(
+                        hello.dev, key, PendingRing(addr[0], local, hello.fw, time.time(), None)
+                    )
+                except HomeAssistantError as err:
+                    _LOGGER.warning("Cannot pair ring %s: %s", hello.dev, err)
+
+        if ring is None:
+            self.pending.pop(hello.dev, None)
+            while len(self.pending) >= MAX_PENDING_RINGS:
+                del self.pending[next(iter(self.pending))]
+            self.pending[hello.dev] = PendingRing(addr[0], local, hello.fw, time.time(), candidate)
+            self._reply(coap.build_ack(msg, coap.CODE_UNAUTHORIZED), addr, local_addr)
             return
+
+        verdict = self._verdict(ring, text, hello)
+        if verdict is _Verdict.REJECT:
+            _LOGGER.debug("Refusing hello from %s as ring %s: bad signature", addr[0], hello.dev)
+            self._reply(coap.build_ack(msg, coap.CODE_UNAUTHORIZED), addr, local_addr)
+            return
+        if verdict is _Verdict.REPEAT:
+            self._reply(coap.build_ack(msg, coap.CODE_CHANGED), addr, local_addr)
+            return
+        if ring.key is not None:
+            ring.replay.accept(hello.boot, hello.n)
+        else:
+            ring.candidate = candidate
+
+        self._ring_seen(hello.dev, addr, local_addr, hello)
         # Acknowledging a trial hello is what lets the ring confirm the image.
         self._reply(coap.build_ack(msg, coap.CODE_CHANGED), addr, local_addr)
 
@@ -628,11 +871,29 @@ class RingServer:
         session.start_sid = ring.sid
         session.image = image
 
+        mac = None
+        if ring.key is not None:
+            if ring.sid is None:
+                raise HomeAssistantError(
+                    "This ring has not checked in yet; press its button or wait for its next hello"
+                )
+            mac = auth.mac(
+                ring.key, auth.notify_text(dev, ring.sid, firmware.version, len(image))
+            )
         code = await self._async_request(
-            ring, lambda mid, token: coap.build_notify(mid, token, firmware.version, len(image))
+            ring,
+            lambda mid, token: coap.build_notify(mid, token, firmware.version, len(image), mac),
         )
         if code is None:
             raise HomeAssistantError("The ring did not answer the update notice")
+        if code == coap.CODE_UNAUTHORIZED:
+            raise HomeAssistantError(
+                "The ring did not accept the update notice. Try again in a minute; it may "
+                "have just restarted."
+                if ring.key is not None
+                else "This ring only takes updates from a Home Assistant it is paired with. "
+                "Enter its pairing code on the NFC Ring page first."
+            )
         if code >> 5 != 2:
             raise HomeAssistantError(
                 f"The ring refused the update notice (CoAP {code >> 5}.{code & 0x1F:02d}); "

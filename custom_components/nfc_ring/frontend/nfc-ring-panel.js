@@ -1,6 +1,7 @@
 // Overview page of the NFC Ring integration: rings, tags and what each tag triggers.
 // Plain web component, no build step. All data comes from the websocket command
 // nfc_ring/overview; the page reloads it when a tag, automation or update changes.
+// A new ring is paired by entering the code from its packaging (nfc_ring/pair).
 
 const TEXT = {
   en: {
@@ -19,13 +20,29 @@ const TEXT = {
     update: "Update to {v} available",
     upToDate: "up to date",
     never: "never",
-    noRings: "No ring has reported yet. A ring appears here on its own as soon as it joins the Thread network.",
+    noRings: "No ring yet. Switch a new ring on and enter the code from its packaging below.",
+    pairing: "Pairing",
+    paired: "Paired",
+    unpaired: "Not paired",
+    unpairedHint: "Set up before pairing existed. Update its firmware, then enter its code below.",
+    unpairedReady: "Enter its code below to secure it.",
+    needsCode: "Waiting for code",
+    tooOld: "Firmware too old",
+    tooOldHint: "This ring cannot be paired yet. It needs firmware 0.4.0 or newer.",
+    newRing: "New ring {id}",
+    addRing: "Add a ring",
+    addHint: "Enter the code from the ring's packaging. Only this code lets a ring trigger anything here.",
+    pair: "Pair ring",
+    pairedNow: "The ring is paired.",
+    waiting: "Code saved. The ring is paired as soon as it reports, usually within a minute. Switch it on if it is off.",
+    invalidCode: "This is not a pairing code. It has 20 characters, for example ABCDE-12345-FGHJK-67890.",
+    pairFailed: "Pairing did not work: {e}",
     noTags: "No tag has been scanned yet. Hold a ring to a tag and it appears here.",
     noAutomation: "no automation",
     createAutomation: "Create",
     off: "off",
     manageTags: "Manage tags",
-    ringHint: "Select a ring to rename or deactivate it. A deactivated ring's scans are ignored.",
+    ringHint: "Select a ring to rename, deactivate or delete it. A deactivated ring's scans are ignored; a deleted ring needs its code again.",
     error: "The overview could not be loaded.",
     justNow: "just now",
   },
@@ -45,13 +62,29 @@ const TEXT = {
     update: "Update auf {v} verfügbar",
     upToDate: "aktuell",
     never: "noch nie",
-    noRings: "Noch kein Ring hat sich gemeldet. Ein Ring erscheint hier von selbst, sobald er im Thread-Netzwerk ist.",
+    noRings: "Noch kein Ring. Neuen Ring einschalten und unten den Code von der Verpackung eingeben.",
+    pairing: "Kopplung",
+    paired: "Gekoppelt",
+    unpaired: "Nicht gekoppelt",
+    unpairedHint: "Eingerichtet, bevor es die Kopplung gab. Erst Firmware aktualisieren, dann unten den Code eingeben.",
+    unpairedReady: "Zum Absichern unten den Code eingeben.",
+    needsCode: "Wartet auf Code",
+    tooOld: "Firmware zu alt",
+    tooOldHint: "Dieser Ring lässt sich noch nicht koppeln. Er braucht Firmware 0.4.0 oder neuer.",
+    newRing: "Neuer Ring {id}",
+    addRing: "Ring hinzufügen",
+    addHint: "Code von der Verpackung des Rings eingeben. Nur mit diesem Code kann ein Ring hier etwas auslösen.",
+    pair: "Ring koppeln",
+    pairedNow: "Der Ring ist gekoppelt.",
+    waiting: "Code gespeichert. Der Ring wird gekoppelt, sobald er sich meldet, meist innerhalb einer Minute. Ring einschalten, falls er aus ist.",
+    invalidCode: "Das ist kein Kopplungscode. Er hat 20 Zeichen, zum Beispiel ABCDE-12345-FGHJK-67890.",
+    pairFailed: "Koppeln hat nicht geklappt: {e}",
     noTags: "Noch kein Tag gescannt. Halte einen Ring an einen Tag, dann erscheint er hier.",
     noAutomation: "keine Automation",
     createAutomation: "Anlegen",
     off: "aus",
     manageTags: "Tags verwalten",
-    ringHint: "Ring anklicken, um ihn umzubenennen oder zu deaktivieren. Scans eines deaktivierten Rings werden ignoriert.",
+    ringHint: "Ring anklicken, um ihn umzubenennen, zu deaktivieren oder zu löschen. Scans eines deaktivierten Rings werden ignoriert; ein gelöschter Ring braucht seinen Code erneut.",
     error: "Die Übersicht konnte nicht geladen werden.",
     justNow: "gerade eben",
   },
@@ -70,6 +103,8 @@ class NfcRingPanel extends HTMLElement {
     this._error = false;
     this._loading = false;
     this._stamp = "";
+    this._pairMsg = null; // {kind: "ok" | "info" | "err", text}
+    this._pairBusy = false;
   }
 
   set hass(hass) {
@@ -103,6 +138,7 @@ class NfcRingPanel extends HTMLElement {
 
   disconnectedCallback() {
     clearInterval(this._timer);
+    clearTimeout(this._poll);
   }
 
   get _t() {
@@ -121,7 +157,37 @@ class NfcRingPanel extends HTMLElement {
     } finally {
       this._loading = false;
     }
+    const t = this._t;
+    if (this._pairMsg?.text === t.waiting && this._data && !this._data.waiting) {
+      // The code found its ring, or ran out.
+      this._pairMsg = this._data.rings.length > this._ringsBefore ? { kind: "ok", text: t.pairedNow } : null;
+    }
     this._render();
+    clearTimeout(this._poll);
+    // New rings and a waiting code change without any entity changing.
+    if (this._data?.waiting) this._poll = setTimeout(() => this._load(), 3000);
+  }
+
+  async _pair() {
+    const t = this._t;
+    const input = this.shadowRoot.querySelector("#code");
+    const code = (input?.value || "").trim();
+    if (!code || this._pairBusy) return;
+    this._pairBusy = true;
+    this._ringsBefore = this._data?.rings.length ?? 0;
+    try {
+      const result = await this._hass.callWS({ type: "nfc_ring/pair", code });
+      input.value = "";
+      this._pairMsg = result.status === "paired" ? { kind: "ok", text: t.pairedNow } : { kind: "info", text: t.waiting };
+    } catch (err) {
+      this._pairMsg = {
+        kind: "err",
+        text: err?.code === "invalid_code" ? t.invalidCode : t.pairFailed.replace("{e}", err?.message || "?"),
+      };
+    } finally {
+      this._pairBusy = false;
+    }
+    await this._load();
   }
 
   _when(iso) {
@@ -144,24 +210,58 @@ class NfcRingPanel extends HTMLElement {
     return `<span title="${esc(full)}">${esc(rel)}</span>`;
   }
 
-  _ringRows(rings) {
+  _ringRows(rings, pending) {
     const t = this._t;
-    return rings
-      .map((r) => {
-        const status = r.disabled
-          ? `<span class="pill off">${t.disabled}</span>`
-          : `<span class="pill on">${t.active}</span>`;
-        const fw = r.update_available
-          ? `${esc(r.firmware || "–")} <span class="pill warn">${esc(t.update.replace("{v}", r.latest_firmware || "?"))}</span>`
-          : `${esc(r.firmware || "–")} <span class="muted">· ${t.upToDate}</span>`;
-        return `<tr class="${r.disabled ? "dim" : ""}">
+    const known = rings.map((r) => {
+      const status = r.disabled
+        ? `<span class="pill off">${t.disabled}</span>`
+        : `<span class="pill on">${t.active}</span>`;
+      const pairing = r.paired
+        ? `<span class="pill on">${t.paired}</span>`
+        : `<span class="pill warn">${t.unpaired}</span><div class="note">${r.can_pair ? t.unpairedReady : t.unpairedHint}</div>`;
+      const fw = r.update_available
+        ? `${esc(r.firmware || "–")} <span class="pill warn">${esc(t.update.replace("{v}", r.latest_firmware || "?"))}</span>`
+        : `${esc(r.firmware || "–")} <span class="muted">· ${t.upToDate}</span>`;
+      return `<tr class="${r.disabled ? "dim" : ""}">
           <td data-l="${t.name}"><div><a href="/config/devices/device/${esc(r.id)}">${esc(r.name)}</a></div></td>
           <td data-l="${t.status}"><div>${status}</div></td>
+          <td data-l="${t.pairing}"><div>${pairing}</div></td>
           <td data-l="${t.firmware}"><div>${fw}</div></td>
           <td data-l="${t.lastScan}"><div>${this._when(r.last_scan)}</div></td>
+          <td data-l="${t.id}" class="mono"><div>${esc(r.dev || "–")}</div></td>
         </tr>`;
-      })
-      .join("");
+    });
+    // Rings that reported but are refused until their code is entered.
+    const waiting = pending.map((p) => {
+      const pairing = p.can_pair
+        ? `<span class="pill warn">${t.needsCode}</span>`
+        : `<span class="pill off">${t.tooOld}</span><div class="note">${t.tooOldHint}</div>`;
+      return `<tr class="dim">
+          <td data-l="${t.name}"><div>${esc(t.newRing.replace("{id}", p.dev.slice(-4).toUpperCase()))}</div></td>
+          <td data-l="${t.status}"><div><span class="muted">–</span></div></td>
+          <td data-l="${t.pairing}"><div>${pairing}</div></td>
+          <td data-l="${t.firmware}"><div>${esc(p.firmware || "–")}</div></td>
+          <td data-l="${t.lastScan}"><div><span class="muted">–</span></div></td>
+          <td data-l="${t.id}" class="mono"><div>${esc(p.dev)}</div></td>
+        </tr>`;
+    });
+    return known.concat(waiting).join("");
+  }
+
+  _pairForm() {
+    const t = this._t;
+    if (!this._hass?.user?.is_admin) return "";
+    const msg = this._pairMsg ? `<p class="msg ${this._pairMsg.kind}">${esc(this._pairMsg.text)}</p>` : "";
+    return `<form class="pair" autocomplete="off">
+        <h3>${t.addRing}</h3>
+        <p class="hint">${t.addHint}</p>
+        <div class="row">
+          <input id="code" type="text" inputmode="text" spellcheck="false" autocapitalize="characters"
+                 maxlength="40" placeholder="XXXXX-XXXXX-XXXXX-XXXXX" aria-label="${t.addRing}">
+          <button type="submit">${t.pair}</button>
+        </div>
+        ${msg}
+      </form>`;
   }
 
   _tagRows(tags) {
@@ -200,11 +300,12 @@ class NfcRingPanel extends HTMLElement {
     } else if (!data) {
       body = "";
     } else {
-      const rings = data.rings.length
+      const pending = data.pending || [];
+      const rings = data.rings.length + pending.length
         ? `<div class="scroll"><table>
-            <thead><tr><th>${t.name}</th><th>${t.status}</th><th>${t.firmware}</th><th>${t.lastScan}</th></tr></thead>
-            <tbody>${this._ringRows(data.rings)}</tbody></table></div>
-           <p class="hint">${t.ringHint}</p>`
+            <thead><tr><th>${t.name}</th><th>${t.status}</th><th>${t.pairing}</th><th>${t.firmware}</th><th>${t.lastScan}</th><th>${t.id}</th></tr></thead>
+            <tbody>${this._ringRows(data.rings, pending)}</tbody></table></div>
+           ${data.rings.length ? `<p class="hint">${t.ringHint}</p>` : ""}`
         : `<p class="empty">${t.noRings}</p>`;
       const tags = data.tags.length
         ? `<div class="scroll"><table>
@@ -215,6 +316,7 @@ class NfcRingPanel extends HTMLElement {
         <section class="card">
           <h2>${t.rings} <span class="count">${data.rings.length}</span></h2>
           ${rings}
+          ${this._pairForm()}
         </section>
         <section class="card">
           <h2>${t.tags} <span class="count">${data.tags.length}</span>
@@ -222,6 +324,11 @@ class NfcRingPanel extends HTMLElement {
           ${tags}
         </section>`;
     }
+    // Rebuilding the page must not eat a code that is being typed.
+    const before = this.shadowRoot.querySelector("#code");
+    const typed = before?.value || "";
+    const focused = before && this.shadowRoot.activeElement === before;
+    const caret = focused ? [before.selectionStart, before.selectionEnd] : null;
     this.shadowRoot.innerHTML = `
       <style>${STYLE}</style>
       <div class="bar"><ha-menu-button></ha-menu-button><h1>${t.title}</h1></div>
@@ -229,6 +336,18 @@ class NfcRingPanel extends HTMLElement {
     const menu = this.shadowRoot.querySelector("ha-menu-button");
     menu.hass = this._hass;
     menu.narrow = this._narrow;
+    const input = this.shadowRoot.querySelector("#code");
+    if (input) {
+      input.value = typed;
+      if (focused) {
+        input.focus();
+        input.setSelectionRange(...caret);
+      }
+      this.shadowRoot.querySelector("form.pair").addEventListener("submit", (ev) => {
+        ev.preventDefault();
+        this._pair();
+      });
+    }
     // Internal links: let Home Assistant navigate instead of reloading the app.
     this.shadowRoot.querySelectorAll('a[href^="/"]').forEach((a) =>
       a.addEventListener("click", (ev) => {
@@ -273,6 +392,21 @@ const STYLE = `
   .pill.warn { color: var(--warning-color, #b26a00); background: color-mix(in srgb, var(--warning-color, #b26a00) 16%, transparent); }
   .hint, .empty { color: var(--secondary-text-color); font-size: 13px; margin: 0; padding: 10px 20px 4px; }
   .empty { font-size: 14px; padding: 8px 20px 12px; }
+  .note { color: var(--secondary-text-color); font-size: 12px; line-height: 1.4; margin-top: 4px; max-width: 26em; }
+  .pair { border-top: 1px solid var(--divider-color, #e0e0e0); margin-top: 12px; padding-top: 4px; }
+  .pair h3 { font-size: 15px; font-weight: 500; margin: 0; padding: 12px 20px 0; }
+  .pair .hint { padding-top: 4px; }
+  .pair .row { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 20px 4px; }
+  .pair input { flex: 1 1 16em; max-width: 22em; min-width: 0; box-sizing: border-box; height: 40px; padding: 0 12px;
+                font: inherit; font-family: var(--ha-font-family-code, ui-monospace, Menlo, Consolas, monospace); letter-spacing: .04em;
+                color: var(--primary-text-color); background: var(--secondary-background-color);
+                border: 1px solid var(--divider-color, #e0e0e0); border-radius: 8px; }
+  .pair input:focus-visible, .pair button:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 1px; }
+  .pair button { height: 40px; padding: 0 18px; font: inherit; font-weight: 500; cursor: pointer; border: none; border-radius: 8px;
+                 color: var(--text-primary-color, #fff); background: var(--primary-color); }
+  .msg { font-size: 14px; margin: 0; padding: 8px 20px 4px; }
+  .msg.ok { color: var(--success-color, #2e7d32); }
+  .msg.err { color: var(--error-color, #c62828); }
   @media (max-width: 700px) {
     main { padding: 8px; }
     thead { display: none; }

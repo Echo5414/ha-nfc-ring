@@ -20,11 +20,19 @@
     "step": {
       "init": {
         "title": "NFC Ring",
-        "description": "The overview page lists rings, tags and the automations they trigger. Switching it off only removes the sidebar entry.",
+        "description": "The overview page shows rings, tags and their automations. Switching it off only removes the sidebar entry. A new ring is paired with the code from its packaging, on the overview page or here.",
         "data": {
-          "show_panel": "Show the \"NFC Ring\" overview page in the sidebar"
+          "show_panel": "Show the \"NFC Ring\" overview page in the sidebar",
+          "pairing_code": "Pairing code of a new ring (optional)"
+        },
+        "data_description": {
+          "pairing_code": "20 characters, e.g. ABCDE-12345-FGHJK-67890. If the ring has not reported yet, it is paired as soon as it does within the next 10 minutes."
         }
       }
+    },
+    "error": {
+      "invalid_code": "This is not a pairing code: it has 20 characters (digits and letters).",
+      "pairing_failed": "Pairing is not possible. Is the integration running, and are fewer than 16 rings set up?"
     }
   }
 }

@@ -20,11 +20,19 @@
     "step": {
       "init": {
         "title": "NFC Ring",
-        "description": "Die Übersichtsseite zeigt Ringe, Tags und die zugehörigen Automationen. Abschalten entfernt nur den Eintrag in der Seitenleiste.",
+        "description": "Die Übersichtsseite zeigt Ringe, Tags und die zugehörigen Automationen. Abschalten entfernt nur den Eintrag in der Seitenleiste. Ein neuer Ring wird mit dem Code von seiner Verpackung gekoppelt, auf der Übersichtsseite oder hier.",
         "data": {
-          "show_panel": "Übersichtsseite „NFC Ring“ in der Seitenleiste anzeigen"
+          "show_panel": "Übersichtsseite „NFC Ring“ in der Seitenleiste anzeigen",
+          "pairing_code": "Kopplungscode eines neuen Rings (optional)"
+        },
+        "data_description": {
+          "pairing_code": "20 Zeichen, z. B. ABCDE-12345-FGHJK-67890. Hat sich der Ring noch nicht gemeldet, wird er gekoppelt, sobald er es in den nächsten 10 Minuten tut."
         }
       }
+    },
+    "error": {
+      "invalid_code": "Das ist kein Kopplungscode: Er hat 20 Zeichen (Ziffern und Buchstaben).",
+      "pairing_failed": "Koppeln nicht möglich. Läuft die Integration, und sind weniger als 16 Ringe eingerichtet?"
     }
   }
 }

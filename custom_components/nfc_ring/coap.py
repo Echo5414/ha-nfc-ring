@@ -21,6 +21,7 @@ CODE_POST = 0x02
 CODE_CHANGED = 0x44  # 2.04
 CODE_CONTENT = 0x45  # 2.05
 CODE_BAD_REQUEST = 0x80  # 4.00
+CODE_UNAUTHORIZED = 0x81  # 4.01
 CODE_BAD_OPTION = 0x82  # 4.02
 CODE_FORBIDDEN = 0x83  # 4.03
 CODE_NOT_FOUND = 0x84  # 4.04
@@ -42,7 +43,7 @@ HELLO_PATH = "hello"
 FIRMWARE_PATH = "fw"  # GET fw/<device id> with Block2
 NOTIFY_PATH = "dfu"  # POST to the ring: an update is waiting
 
-# A scan or hello is ~80 bytes; the cap also keeps json.loads far from
+# A signed scan or hello is ~140 bytes; the cap also keeps json.loads far from
 # Python's recursion limit on hostile input like "[[[[...".
 MAX_PAYLOAD = 256
 
@@ -62,6 +63,7 @@ MCUBOOT_IMAGE_MAGIC = 0x96F3B83D
 _DEV_RE = re.compile(r"[0-9a-f]{16}")
 _UID_RE = re.compile(r"(?:[0-9A-F]{2}){1,10}")
 _VERSION_RE = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,5}")
+_MAC_RE = re.compile(r"[0-9a-f]{16}")
 _UINT32_MAX = 0xFFFFFFFF
 
 
@@ -83,6 +85,10 @@ class ScanEvent:
     uid: str  # tag UID, upper-case hex
     sid: int  # random per ring boot
     seq: int  # scan counter within a boot
+    # Signature (see auth.py); all None from firmware before 0.4.0.
+    boot: int | None = None
+    n: int | None = None
+    mac: str | None = None
 
     @property
     def key(self) -> tuple[str, int, int]:
@@ -95,6 +101,9 @@ class Hello:
     fw: str  # running firmware version, e.g. "0.2.0"
     sid: int
     confirmed: bool  # False while a freshly installed firmware is on trial
+    boot: int | None = None
+    n: int | None = None
+    mac: str | None = None
 
 
 @dataclass(frozen=True)
@@ -222,9 +231,17 @@ def build_block_response(msg: CoapMessage, block: Block, data: bytes) -> bytes:
     )
 
 
-def build_notify(mid: int, token: bytes, version: str, size: int) -> bytes:
-    """Confirmable POST /dfu telling a ring to download an update."""
-    payload = json.dumps({"ver": version, "size": size}, separators=(",", ":")).encode()
+def build_notify(
+    mid: int, token: bytes, version: str, size: int, mac: str | None = None
+) -> bytes:
+    """Confirmable POST /dfu telling a ring to download an update.
+
+    Firmware from 0.4.0 on only accepts it with a valid mac (auth.notify_text).
+    """
+    fields: dict[str, object] = {"ver": version, "size": size}
+    if mac is not None:
+        fields["mac"] = mac
+    payload = json.dumps(fields, separators=(",", ":")).encode()
     options = [
         (OPT_URI_PATH, NOTIFY_PATH.encode()),
         (OPT_CONTENT_FORMAT, _encode_uint(CONTENT_FORMAT_JSON)),
@@ -252,6 +269,18 @@ def _check_dev(dev: object) -> str:
     return dev
 
 
+def _signature(obj: dict) -> tuple[int, int, str] | tuple[None, None, None]:
+    """The fields boot, n and mac: all three or none of them."""
+    boot, n, mac = (obj.get(k) for k in ("boot", "n", "mac"))
+    if boot is None and n is None and mac is None:
+        return None, None, None
+    if not (_uint32(boot) and boot >= 1 and _uint32(n) and n >= 1):
+        raise ValueError("bad boot/n")
+    if not (isinstance(mac, str) and _MAC_RE.fullmatch(mac)):
+        raise ValueError("bad mac")
+    return boot, n, mac
+
+
 def parse_event(payload: bytes) -> ScanEvent:
     """Validates a scan payload; raises ValueError if it is not a valid scan."""
     event = _load_object(payload)
@@ -261,7 +290,7 @@ def parse_event(payload: bytes) -> ScanEvent:
         raise ValueError(f"bad uid {uid!r}")
     if not (_uint32(sid) and _uint32(seq)):
         raise ValueError("bad sid/seq")
-    return ScanEvent(dev, uid, sid, seq)
+    return ScanEvent(dev, uid, sid, seq, *_signature(event))
 
 
 def parse_hello(payload: bytes) -> Hello:
@@ -277,7 +306,7 @@ def parse_hello(payload: bytes) -> Hello:
         raise ValueError("bad sid")
     if not isinstance(confirmed, bool):
         raise ValueError("bad confirmed")
-    return Hello(dev, fw, sid, confirmed)
+    return Hello(dev, fw, sid, confirmed, *_signature(hello))
 
 
 def image_version(image: bytes) -> str:
@@ -334,6 +363,12 @@ class DuplicateFilter:
         self._seen[key] = [now, False]
         self._pending += 1
         return ScanState.NEW
+
+    def peek(self, key: tuple[str, int, int]) -> ScanState | None:
+        """DONE or PENDING for a tracked scan, None for an unknown one."""
+        if (entry := self._seen.get(key)) is None:
+            return None
+        return ScanState.DONE if entry[1] else ScanState.PENDING
 
     def finish(self, key: tuple[str, int, int]) -> None:
         """Marks an admitted scan as recorded."""

@@ -16,6 +16,9 @@ FIRMWARE_REPOSITORY = "Echo5414/nfc-ring-releases"
 # Option: show the overview page in the sidebar (default: yes).
 CONF_SHOW_PANEL = "show_panel"
 
+# Options form only, never stored: pairs a ring when the page is switched off.
+CONF_PAIRING_CODE = "pairing_code"
+
 # Dispatcher signals
 SIGNAL_RING_ADDED = f"{DOMAIN}_ring_added"
 SIGNAL_RING_CHANGED = f"{DOMAIN}_ring_changed"  # argument: device id
