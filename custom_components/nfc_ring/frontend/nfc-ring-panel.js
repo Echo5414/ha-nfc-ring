@@ -34,6 +34,11 @@ const TEXT = {
     addRing: "Add a ring",
     addHint: "Enter the code from the ring's packaging. Only this code lets a ring trigger anything here.",
     pair: "Pair ring",
+    scan: "Scan code",
+    scanTitle: "Scan the ring's code",
+    scanHint: "Point the camera at the code on the ring's packaging.",
+    scanManual: "Type it instead",
+    scanWrong: "This is not a ring's pairing code.",
     pairedNow: "The ring is paired.",
     waiting: "Code saved. The ring is paired as soon as it reports or reads a tag, usually within a minute. Switch it on if it is off.",
     invalidCode: "This is not a pairing code. It has 20 characters, for example ABCDE-12345-FGHJK-67890.",
@@ -85,6 +90,11 @@ const TEXT = {
     addRing: "Ring hinzufügen",
     addHint: "Code von der Verpackung des Rings eingeben. Nur mit diesem Code kann ein Ring hier etwas auslösen.",
     pair: "Ring koppeln",
+    scan: "Code scannen",
+    scanTitle: "Code des Rings scannen",
+    scanHint: "Kamera auf den Code auf der Verpackung des Rings richten.",
+    scanManual: "Lieber eintippen",
+    scanWrong: "Das ist kein Kopplungscode eines Rings.",
     pairedNow: "Der Ring ist gekoppelt.",
     waiting: "Code gespeichert. Der Ring wird gekoppelt, sobald er sich meldet oder einen Tag liest, meist innerhalb einer Minute. Ring einschalten, falls er aus ist.",
     invalidCode: "Das ist kein Kopplungscode. Er hat 20 Zeichen, zum Beispiel ABCDE-12345-FGHJK-67890.",
@@ -110,6 +120,13 @@ const TEXT = {
 };
 
 const WATCHED = /^(tag|automation|update)\./;
+
+// The pairing code in what a scanner read: the code alone, or at the end of
+// a longer text such as a link. Home Assistant checks it properly.
+const codeIn = (text) => {
+  const found = /(?:^|[^0-9A-Za-z])((?:[0-9A-Za-z]{5}[- ]?){3}[0-9A-Za-z]{5})$/.exec(String(text ?? "").trim());
+  return found ? found[1] : null;
+};
 
 const esc = (value) =>
   String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -156,6 +173,8 @@ class NfcRingPanel extends HTMLElement {
   }
 
   disconnectedCallback() {
+    this._scanStop?.();
+    this._scanStop = null;
     clearInterval(this._timer);
     clearTimeout(this._poll);
   }
@@ -207,6 +226,46 @@ class NfcRingPanel extends HTMLElement {
       this._pairBusy = false;
     }
     await this._load();
+  }
+
+  // The companion apps bring a scanner the page may open; a plain browser
+  // has none, so the button is only shown inside the app.
+  get _scanner() {
+    const external = this._hass?.auth?.external;
+    return external?.config?.hasBarCodeScanner ? external : null;
+  }
+
+  _scan() {
+    const t = this._t;
+    const external = this._scanner;
+    if (!external || this._scanStop) return;
+    const stop = () => {
+      this._scanStop?.();
+      this._scanStop = null;
+    };
+    this._scanStop = external.addCommandHandler((msg) => {
+      if (msg.command === "bar_code/aborted") {
+        stop();
+        if (msg.payload?.reason === "alternative_options") this.shadowRoot.querySelector("#code")?.focus();
+        return true;
+      }
+      if (msg.command !== "bar_code/scan_result") return false;
+      const code = codeIn(msg.payload?.rawValue);
+      if (!code) {
+        external.fireMessage({ type: "bar_code/notify", payload: { message: t.scanWrong } });
+        return true;
+      }
+      stop();
+      external.fireMessage({ type: "bar_code/close" });
+      const input = this.shadowRoot.querySelector("#code");
+      if (input) input.value = code;
+      this._pair();
+      return true;
+    });
+    external.fireMessage({
+      type: "bar_code/scan",
+      payload: { title: t.scanTitle, description: t.scanHint, alternative_option_label: t.scanManual },
+    });
   }
 
   async _setRadio(dev, radio) {
@@ -312,6 +371,7 @@ class NfcRingPanel extends HTMLElement {
           <input id="code" type="text" inputmode="text" spellcheck="false" autocapitalize="characters"
                  maxlength="40" placeholder="XXXXX-XXXXX-XXXXX-XXXXX" aria-label="${t.addRing}">
           <button type="submit">${t.pair}</button>
+          ${this._scanner ? `<button type="button" id="scan" class="second">${t.scan}</button>` : ""}
         </div>
         ${msg}
       </form>`;
@@ -407,6 +467,7 @@ class NfcRingPanel extends HTMLElement {
         ev.preventDefault();
         this._pair();
       });
+      this.shadowRoot.querySelector("#scan")?.addEventListener("click", () => this._scan());
     }
     this.shadowRoot.querySelectorAll("select.radio").forEach((select) => {
       select.addEventListener("change", () => {
@@ -473,6 +534,7 @@ const STYLE = `
   .pair input:focus-visible, .pair button:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 1px; }
   .pair button { height: 40px; padding: 0 18px; font: inherit; font-weight: 500; cursor: pointer; border: none; border-radius: 8px;
                  color: var(--text-primary-color, #fff); background: var(--primary-color); }
+  .pair button.second { color: var(--primary-color); background: none; border: 1px solid var(--primary-color); }
   select.radio { font: inherit; height: 32px; padding: 0 6px; color: var(--primary-text-color);
                  background: var(--secondary-background-color); border: 1px solid var(--divider-color, #e0e0e0); border-radius: 8px; }
   select.radio:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 1px; }

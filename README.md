@@ -57,6 +57,9 @@ characters, printed on its packaging (`XXXXX-XXXXX-XXXXX-XXXXX`).
 1. Switch the ring on. Once it is on your Thread network it shows up on the
    **NFC Ring** page as "New ring … – Waiting for code".
 2. Enter the code under **Add a ring** and press **Pair ring**.
+   In the Home Assistant app on a phone, **Scan code** reads it with the
+   camera instead, if the packaging shows it as a QR code (the code as
+   plain text). A browser has no scanner; type the code there.
 
 You can also enter the code first; the ring is then paired as soon as it
 reports (a code waits for ten minutes). With the page switched off, the code
