@@ -13,6 +13,16 @@ Against replays each message has a pair (boot, n) that only grows: the ring
 stores boot and increments it at every start, n counts the messages since
 then. ReplayWindow remembers per ring which pairs were already used.
 
+From ring firmware 0.6.0 that key only pairs. The ring's hello offers an
+X25519 public key ("pk", and "pm" = MAC of offer_text), Home Assistant
+answers with its own and the MAC of pair_text, both under the key from the
+code, and from then on every message is signed with
+
+    link key = HMAC-SHA256(shared secret, "nfc-ring link v1|dev|ring pk|HA pk")
+
+Whoever reads the code off the packaging later can then neither sign as the
+ring nor read what was agreed. The factory reset erases the link key.
+
 Nothing here depends on the radio (Thread, Bluetooth, Zigbee) or on Home
 Assistant; tools and tests import it on its own.
 """
@@ -29,8 +39,10 @@ from enum import Enum, auto
 ALPHABET = "0123456789ABCDEFGHJKLMNPRSTUVWXY"
 CODE_LEN = 20
 MAC_HEX_LEN = 16
+PK_HEX_LEN = 64
 
 _KEY_LABEL = "nfc-ring pairing v1|"
+_LINK_LABEL = "nfc-ring link v1"
 _WINDOW = 64
 _WINDOW_MASK = (1 << _WINDOW) - 1
 
@@ -87,6 +99,38 @@ def ble_scan_text(dev: str, uid: str, boot: int, n: int) -> str:
 def ack_text(dev: str, boot: int, n: int) -> str:
     """Home Assistant's answer to the hello with this boot and n, over Bluetooth."""
     return f"ack|{dev}|{boot}|{n}"
+
+
+def offer_text(dev: str, pk: str, boot: int, n: int) -> str:
+    """Ties the public key a hello offers to that hello."""
+    return f"offer|{dev}|{pk}|{boot}|{n}"
+
+
+def pair_text(dev: str, ring_pk: str, ha_pk: str, boot: int, n: int) -> str:
+    """Home Assistant's answer to the offer in the hello with this boot and n."""
+    return f"pair|{dev}|{ring_pk}|{ha_pk}|{boot}|{n}"
+
+
+def link_key(shared: bytes, dev: str, ring_pk: str, ha_pk: str) -> bytes:
+    text = f"{_LINK_LABEL}|{dev}|{ring_pk}|{ha_pk}"
+    return hmac.new(shared, text.encode(), hashlib.sha256).digest()
+
+
+def agree(dev: str, ring_pk: str) -> tuple[str, bytes]:
+    """Our half of the key agreement: (our public key as hex, the link key).
+
+    Raises ValueError if ring_pk is not a usable public key.
+    """
+    # Only pairing needs it; tools that just verify messages do not.
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (  # noqa: PLC0415
+        X25519PrivateKey,
+        X25519PublicKey,
+    )
+
+    private = X25519PrivateKey.generate()
+    ha_pk = private.public_key().public_bytes_raw().hex()
+    shared = private.exchange(X25519PublicKey.from_public_bytes(bytes.fromhex(ring_pk)))
+    return ha_pk, link_key(shared, dev, ring_pk, ha_pk)
 
 
 def notify_text(dev: str, sid: int, version: str, size: int) -> str:

@@ -113,7 +113,13 @@ def _ws_pair(
     except HomeAssistantError as err:
         connection.send_error(msg["id"], "failed", str(err))
         return
-    connection.send_result(msg["id"], {"status": "paired" if dev else "waiting", "dev": dev})
+    if dev is None:
+        status = "waiting"
+    else:
+        # A ring that agrees on a key of its own does so with its next hello.
+        ring = server.rings.get(dev)
+        status = "paired" if ring is not None and ring.key is not None else "pairing"
+    connection.send_result(msg["id"], {"status": status, "dev": dev})
 
 
 @websocket_api.websocket_command(
@@ -291,6 +297,8 @@ def build_overview(hass: HomeAssistant) -> dict[str, Any]:
                     "dev": dev,
                     # False: known from before pairing existed, still unsigned.
                     "paired": ring is not None and ring.key is not None,
+                    # Its code is in; it gets its key with its next hello.
+                    "pairing": ring is not None and ring.key is None and ring.pair_key is not None,
                     # Its firmware signs, so entering the code is all it takes.
                     # After a restart nothing signed was heard yet; go by the version.
                     "can_pair": ring is not None

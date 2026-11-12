@@ -131,6 +131,10 @@ class Candidate:
     mac: str
     boot: int
     n: int
+    # True: from a hello, which also tells whether the firmware agrees on a
+    # key of its own (0.6.0 on). False: from a scan, which does not.
+    hello: bool = False
+    offers: bool = False
 
 
 @dataclass
@@ -139,8 +143,18 @@ class Ring:
     local: str | None = None  # our address the ring talks to (its "server")
     fw: str | None = None  # firmware version from the last hello
     sid: int | None = None  # boot session from the last hello
-    # None: known from before pairing existed and not paired yet.
+    # The key the ring's messages are signed with. None: not paired (known
+    # from before pairing existed, or its code is entered and the key
+    # agreement has not happened yet, see pair_key).
     key: bytes | None = None
+    # The key from the pairing code, kept only while it is still needed: it
+    # lets the ring agree on a key of its own (firmware 0.6.0 on), and is
+    # forgotten once the ring uses that key. Equal to key for a ring whose
+    # firmware is older and signs with the key from the code.
+    pair_key: bytes | None = None
+    # The last key agreement answered: ((boot, n, ring's public key), the
+    # answer), sent again if the ring repeats that hello.
+    agreed: tuple[tuple[int, int, str], dict] | None = None
     replay: auth.ReplayWindow = field(default_factory=auth.ReplayWindow)
     candidate: Candidate | None = None  # only while unpaired
     # From a hello of firmware 0.5.0 on. board None: older firmware, which
@@ -172,6 +186,16 @@ class _Verdict(Enum):
     FRESH = auto()  # act on it
     REPEAT = auto()  # a copy of a message already acted on
     REJECT = auto()  # unsigned, wrongly signed or too old
+
+
+_LINK_FIRMWARE = (0, 6, 0)  # the first that agrees on a key of its own
+
+
+def _agrees(firmware: str | None) -> bool | None:
+    """True if this firmware agrees on its own key; None if it is not known."""
+    if not firmware:
+        return None
+    return coap.version_key(firmware) >= _LINK_FIRMWARE
 
 
 class _HelloResult(Enum):
@@ -353,13 +377,19 @@ class RingServer:
             try:
                 if data.get("key"):
                     ring.key = bytes.fromhex(data["key"])
+                if data.get("pair"):
+                    ring.pair_key = bytes.fromhex(data["pair"])
+                elif ring.key is not None and not data.get("linked"):
+                    # Paired before 0.8.0: its key is the one from the code.
+                    ring.pair_key = ring.key
+                if ring.key is not None or ring.pair_key is not None:
                     ring.replay = auth.ReplayWindow(
                         int(data["boot"]), int(data["top"]), int(data["mask"], 16)
                     )
             except (KeyError, TypeError, ValueError):
                 # Without its counters a key would accept replays: pair again.
                 _LOGGER.error("Stored pairing of ring %s is damaged; pair it again", dev)
-                ring.key = None
+                ring.key = ring.pair_key = None
             self.rings.setdefault(dev, ring)
         # GitHub is checked in the background once setup is done.
         await self.async_scan_firmware(skip_release_check=True)
@@ -436,9 +466,11 @@ class RingServer:
                 "ble": ring.ble,
                 "wanted": ring.wanted,
             }
-            if ring.key is not None:
+            if ring.key is not None or ring.pair_key is not None:
                 data |= {
-                    "key": ring.key.hex(),
+                    "key": ring.key.hex() if ring.key is not None else None,
+                    "pair": ring.pair_key.hex() if ring.pair_key is not None else None,
+                    "linked": ring.pair_key is None,
                     "boot": ring.replay.boot,
                     "top": ring.replay.top,
                     "mask": f"{ring.replay.mask:x}",
@@ -454,7 +486,9 @@ class RingServer:
     ) -> _Verdict:
         """Checks a known ring's message; the caller accepts what is FRESH."""
         if ring.key is None:
-            return _Verdict.FRESH
+            # Unsigned from before pairing existed, unless its code is in:
+            # then nothing counts until it has its key.
+            return _Verdict.FRESH if ring.pair_key is None else _Verdict.REJECT
         if text is None or not auth.verify(ring.key, text, message.mac):
             return _Verdict.REJECT
         freshness = ring.replay.check(message.boot, message.n)
@@ -463,7 +497,29 @@ class RingServer:
         return _Verdict.REPEAT if freshness is auth.Freshness.SEEN else _Verdict.FRESH
 
     @callback
-    def _pair(self, dev: str, key: bytes, known: PendingRing | None = None) -> Ring:
+    def _accepted(self, ring: Ring, boot: int, n: int) -> None:
+        """A message signed with the ring's key was taken."""
+        ring.replay.accept(boot, n)
+        if ring.pair_key is not None and ring.pair_key != ring.key:
+            # The ring uses the key agreed at pairing: the code has done its work.
+            ring.pair_key = ring.agreed = None
+            self._store.async_delay_save(self._stored_rings, 0)
+
+    @callback
+    def _pair(
+        self,
+        dev: str,
+        key: bytes,
+        known: PendingRing | None = None,
+        agrees: bool | None = None,
+    ) -> Ring:
+        """The code of this ring is proven; key is the key derived from it.
+
+        A ring known to agree on a key of its own (agrees True) does that
+        with its next hello and is paired then. Any other is paired now and
+        signs with the key from the code; if its firmware turns out to be
+        newer, its next hello replaces that key.
+        """
         ring = self.rings.get(dev)
         added = ring is None
         if added:
@@ -473,7 +529,9 @@ class RingServer:
             if known is not None:
                 ring.address, ring.local, ring.fw = known.address, known.local, known.fw or None
                 ring.link, ring.ble = known.link, known.ble
-        ring.key = key
+        ring.pair_key = key
+        ring.key = None if agrees else key
+        ring.agreed = None
         ring.replay = auth.ReplayWindow()
         ring.candidate = None
         self.pending.pop(dev, None)
@@ -483,7 +541,9 @@ class RingServer:
         async_dispatcher_send(
             self.hass, *((SIGNAL_RING_ADDED,) if added else (SIGNAL_RING_CHANGED, dev))
         )
-        _LOGGER.info("Ring %s is paired", dev)
+        _LOGGER.info(
+            "Ring %s: %s", dev, "paired" if ring.key else "code accepted, agreeing on a key"
+        )
         if self.ble is not None:
             # A ring on Bluetooth waits for us to connect and answer its hello.
             self.ble.kick(dev)
@@ -512,7 +572,12 @@ class RingServer:
         for dev, candidate, known in waiting:
             key = auth.derive_key(code, dev)
             if auth.verify(key, candidate.text, candidate.mac):
-                ring = self._pair(dev, key, known)
+                agrees = (
+                    candidate.offers
+                    if candidate.hello
+                    else _agrees(known.fw if known is not None else self.rings[dev].fw)
+                )
+                ring = self._pair(dev, key, known, agrees)
                 # The hello that proved the code is used up.
                 ring.replay.accept(candidate.boot, candidate.n)
                 return dev
@@ -752,12 +817,12 @@ class RingServer:
         text = None
         if event.mac is not None:
             text = auth.scan_text(event.dev, event.uid, event.sid, event.seq, event.boot, event.n)
-        if ring is not None and ring.key is None and text is not None:
+        if ring is not None and ring.key is None and ring.pair_key is None and text is not None:
             # Known from before pairing, and its firmware signs: a scan can
             # prove an entered code just like a hello does.
             key = self._key_from_waiting_code(event.dev, text, event.mac)
             if key is not None:
-                ring = self._pair(event.dev, key)
+                ring = self._pair(event.dev, key, agrees=_agrees(ring.fw))
             else:
                 ring.candidate = Candidate(text, event.mac, event.boot, event.n)
         elif ring is None and text is not None:
@@ -775,7 +840,7 @@ class RingServer:
             key = self._key_from_waiting_code(event.dev, text, event.mac)
             if key is not None:
                 try:
-                    ring = self._pair(event.dev, key, known)
+                    ring = self._pair(event.dev, key, known, _agrees(known.fw))
                 except HomeAssistantError as err:
                     _LOGGER.warning("Cannot pair ring %s: %s", event.dev, err)
             else:
@@ -783,6 +848,8 @@ class RingServer:
                 while len(self.pending) >= MAX_PENDING_RINGS:
                     del self.pending[next(iter(self.pending))]
                 self.pending[event.dev] = known
+        # A ring that still has to agree on its key is refused here; that
+        # makes it say hello, which is where the agreement happens.
         if ring is None or (verdict := self._verdict(ring, text, event)) is _Verdict.REJECT:
             _LOGGER.debug("Refusing scan from %s as ring %s: not paired", addr[0], event.dev)
             self._reply(coap.build_ack(msg, coap.CODE_UNAUTHORIZED), addr, local_addr)
@@ -820,7 +887,7 @@ class RingServer:
             # real result then.
             return
         if ring.key is not None:
-            ring.replay.accept(event.boot, event.n)
+            self._accepted(ring, event.boot, event.n)
         if state is coap.ScanState.DONE:
             # Retransmission: the ring missed our first reply.
             self._reply(coap.build_ack(msg, coap.CODE_CHANGED), addr, local_addr)
@@ -866,7 +933,15 @@ class RingServer:
             return
 
         local = socket.inet_ntop(socket.AF_INET6, local_addr) if local_addr else None
-        result = self._process_hello(hello, link=LINK_THREAD, address=addr[0], local=local)
+        result, answer = self._process_hello(
+            hello, link=LINK_THREAD, address=addr[0], local=local
+        )
+        if answer is not None:
+            # The key agreement; the ring says hello again with its new key.
+            self._reply(
+                coap.build_ack(msg, coap.CODE_CHANGED, _compact(answer)), addr, local_addr
+            )
+            return
         if result is _HelloResult.REFUSED:
             _LOGGER.debug("Refusing hello from %s as ring %s: not paired", addr[0], hello.dev)
             self._reply(coap.build_ack(msg, coap.CODE_UNAUTHORIZED), addr, local_addr)
@@ -888,19 +963,27 @@ class RingServer:
         address: str | None = None,
         local: str | None = None,
         ble_address: str | None = None,
-    ) -> _HelloResult:
-        """Checks a hello from either radio and records what it says."""
+    ) -> tuple[_HelloResult, dict | None]:
+        """Checks a hello from either radio and records what it says.
+
+        The second value is the answer of a key agreement, if this hello
+        offered one and the ring's code is known; it goes back to the ring.
+        """
         ring = self.rings.get(hello.dev)
         text = _hello_text(hello)
-        candidate = Candidate(text, hello.mac, hello.boot, hello.n) if text is not None else None
+        candidate = None
+        if text is not None:
+            candidate = Candidate(
+                text, hello.mac, hello.boot, hello.n, hello=True, offers=hello.pk is not None
+            )
 
-        if (ring is None or ring.key is None) and text is not None:
+        if (ring is None or (ring.key is None and ring.pair_key is None)) and text is not None:
             # Its code may have been entered before the ring was heard.
             key = self._key_from_waiting_code(hello.dev, text, hello.mac)
             if key is not None:
                 known = PendingRing(address, local, hello.fw, time.time(), None, link, ble_address)
                 try:
-                    ring = self._pair(hello.dev, key, known)
+                    ring = self._pair(hello.dev, key, known, hello.pk is not None)
                 except HomeAssistantError as err:
                     _LOGGER.warning("Cannot pair ring %s: %s", hello.dev, err)
 
@@ -911,20 +994,40 @@ class RingServer:
             self.pending[hello.dev] = PendingRing(
                 address, local, hello.fw, time.time(), candidate, link, ble_address
             )
-            return _HelloResult.REFUSED
+            return _HelloResult.REFUSED, None
 
-        if ring.key is None and link == LINK_BLUETOOTH:
+        if ring.key is None and ring.pair_key is None and link == LINK_BLUETOOTH:
             # Over Bluetooth our answer is signed, and that takes the key.
             ring.candidate = candidate
-            return _HelloResult.REFUSED
+            return _HelloResult.REFUSED, None
+
+        if ring.pair_key is not None and text is not None and hello.pk is not None:
+            answer = self._agree(ring, hello, text)
+            if answer is None:
+                return _HelloResult.REFUSED, None
+            self._ring_seen(hello.dev, address, local, hello, link=link, ble_address=ble_address)
+            return _HelloResult.ACCEPTED, answer
+
+        if ring.key is None and ring.pair_key is not None:
+            # Its code is in, and this hello offers no key agreement: older
+            # firmware, which signs with the key from the code.
+            if (
+                text is None
+                or not auth.verify(ring.pair_key, text, hello.mac)
+                or ring.replay.check(hello.boot, hello.n) is not auth.Freshness.NEW
+            ):
+                return _HelloResult.REFUSED, None
+            ring.key = ring.pair_key
+            self._store.async_delay_save(self._stored_rings, 0)
+            _LOGGER.info("Ring %s is paired", hello.dev)
 
         verdict = self._verdict(ring, text, hello)
         if verdict is _Verdict.REJECT:
-            return _HelloResult.REFUSED
+            return _HelloResult.REFUSED, None
         if verdict is _Verdict.REPEAT:
-            return _HelloResult.REPEAT
+            return _HelloResult.REPEAT, None
         if ring.key is not None:
-            ring.replay.accept(hello.boot, hello.n)
+            self._accepted(ring, hello.boot, hello.n)
         else:
             ring.candidate = candidate
 
@@ -933,13 +1036,13 @@ class RingServer:
         session = self.updates.get(hello.dev)
         if session is None or session.done.done() or not session.image:
             # No update, or still preparing it (the ring has not been told yet).
-            return _HelloResult.ACCEPTED
+            return _HelloResult.ACCEPTED, None
         if hello.sid == session.start_sid or (
             session.start_sid is None and session.downloaded_at is None
         ):
             # Still the boot that is downloading; nothing installed yet. (Without
             # a known boot session, only hellos after the last block can count.)
-            return _HelloResult.ACCEPTED
+            return _HelloResult.ACCEPTED, None
         if hello.fw != session.version:
             session.done.set_result(
                 f"ring restarted with {hello.fw} instead of {session.version}: "
@@ -948,7 +1051,40 @@ class RingServer:
         elif hello.confirmed:
             session.done.set_result(None)
         # else: new image on trial; the ring confirms it now and says hello again.
-        return _HelloResult.ACCEPTED
+        return _HelloResult.ACCEPTED, None
+
+    @callback
+    def _agree(self, ring: Ring, hello: coap.Hello, text: str) -> dict | None:
+        """The key agreement a hello offers; our answer, None if it is not genuine.
+
+        The hello has to prove the pairing code. Our answer does the same,
+        and both sides derive the key the ring signs with from then on. It
+        counts once the ring uses it; until then the ring may ask again.
+        """
+        key = ring.pair_key
+        offer = auth.offer_text(hello.dev, hello.pk, hello.boot, hello.n)
+        if not (auth.verify(key, text, hello.mac) and auth.verify(key, offer, hello.pm)):
+            return None
+        stamp = (hello.boot, hello.n)
+        if ring.agreed is not None and ring.agreed[0] == (*stamp, hello.pk):
+            return ring.agreed[1]  # our answer got lost; the same again
+        if ring.replay.check(*stamp) is not auth.Freshness.NEW:
+            return None
+        try:
+            ha_pk, link = auth.agree(hello.dev, hello.pk)
+        except ValueError:
+            return None
+        ring.replay.accept(*stamp)
+        ring.key = link
+        answer = {
+            "pk": ha_pk,
+            "mac": auth.mac(key, auth.pair_text(hello.dev, hello.pk, ha_pk, *stamp)),
+        }
+        ring.agreed = ((*stamp, hello.pk), answer)
+        self._store.async_delay_save(self._stored_rings, 0)
+        async_dispatcher_send(self.hass, SIGNAL_RING_CHANGED, hello.dev)
+        _LOGGER.info("Ring %s agreed on a key of its own", hello.dev)
+        return answer
 
     def _on_firmware_block(
         self, msg: coap.CoapMessage, addr: tuple, local_addr: bytes | None
@@ -1435,7 +1571,10 @@ class RingServer:
         except ValueError as err:
             _LOGGER.debug("Invalid hello from %s: %s", ble_address, err)
             return None, None
-        result = self._process_hello(hello, link=LINK_BLUETOOTH, ble_address=ble_address)
+        result, answer = self._process_hello(hello, link=LINK_BLUETOOTH, ble_address=ble_address)
+        if answer is not None:
+            # The key agreement; the ring says hello again with its new key.
+            return hello, _compact({"st": "ok"} | answer)
         ring = self.rings.get(hello.dev)
         if result is _HelloResult.REFUSED or ring is None or ring.key is None:
             return hello, None
@@ -1470,7 +1609,7 @@ class RingServer:
                 continue
             if ring.replay.check(scan.boot, scan.n) is not auth.Freshness.NEW:
                 return  # the same scan again (it is repeated for a few seconds), or a replay
-            ring.replay.accept(scan.boot, scan.n)
+            self._accepted(ring, scan.boot, scan.n)
             ring.ble = ble_address
             self._store.async_delay_save(self._stored_rings, _STORAGE_SAVE_DELAY)
             if self._ensure_device(candidate).disabled:
@@ -1492,8 +1631,8 @@ class RingServer:
         entered code just as well, now or later.
         """
         ring = self.rings.get(dev)
-        if ring is not None and ring.key is not None:
-            return  # paired, and the signature did not fit
+        if ring is not None and (ring.key is not None or ring.pair_key is not None):
+            return  # paired and the signature did not fit, or about to agree on its key
         text = auth.ble_scan_text(dev, scan.uid, scan.boot, scan.n)
         candidate = Candidate(text, scan.mac, scan.boot, scan.n)
         heard = self.pending.get(dev)
@@ -1503,11 +1642,13 @@ class RingServer:
         key = self._key_from_waiting_code(dev, text, scan.mac)
         if key is not None:
             try:
-                self._pair(dev, key, known)
+                paired = self._pair(dev, key, known, _agrees(known.fw or (ring.fw if ring else None)))
             except HomeAssistantError as err:
                 _LOGGER.warning("Cannot pair ring %s: %s", dev, err)
                 return
-            self.ble_scan(ble_address, scan, dev)
+            if paired.key is not None:
+                self.ble_scan(ble_address, scan, dev)
+            # else: the connection _pair asked for brings its hello and the key
         elif ring is not None:
             ring.candidate = candidate
         elif heard is None or heard.candidate is None or (

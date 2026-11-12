@@ -61,6 +61,10 @@ characters, printed on its packaging (`XXXXX-XXXXX-XXXXX-XXXXX`).
    camera instead, if the packaging shows it as a QR code (the code as
    plain text). A browser has no scanner; type the code there.
 
+Rings with firmware 0.6.0 or newer use the code only for pairing: ring and
+Home Assistant agree on a key of their own, and afterwards the code alone
+no longer lets anyone act as the ring (details in `PAIRING.md`).
+
 You can also enter the code first; the ring is then paired as soon as it
 reports (a code waits for ten minutes). With the page switched off, the code
 goes into **Settings → Devices & services → NFC Ring → Configure**.

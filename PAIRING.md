@@ -26,6 +26,64 @@ Implemented in `custom_components/nfc_ring/auth.py` (Home Assistant) and
 `dev` is the ring's device id (16 lower-case hex characters). Home
 Assistant stores the key, not the code.
 
+From ring firmware 0.6.0 and integration 0.8.0 this key only pairs; see
+"A key of its own" below. Older firmware signs every message with it.
+
+## A key of its own (ring 0.6.0, integration 0.8.0)
+
+The code is printed on the packaging and never changes. If the key from the
+code signed every message, anyone who ever saw the packaging could sign as
+the ring for good. So the code is only used to agree on another key:
+
+1. A ring without a key of its own adds to its hello
+
+       "pk": its X25519 public key (64 hex), fresh at every start
+       "pm": MAC of "offer|dev|pk|boot|n"
+
+   and signs both the hello and `pm` with the key from the code.
+2. Home Assistant, once it has the ring's code, answers the hello (payload
+   of the CoAP 2.04, or the Bluetooth answer) with
+
+       {"pk": its own X25519 public key, "mac": MAC of "pair|dev|ring pk|HA pk|boot|n"}
+
+   also under the key from the code, so the ring knows the answer comes
+   from someone who has the code.
+3. Both compute
+
+       link key = HMAC-SHA256(key = X25519 shared secret,
+                              msg = "nfc-ring link v1|dev|ring pk|HA pk")
+
+   The ring stores it (`ringauth/key`) and signs everything with it from
+   then on, starting with a new hello. The settings key is derived from it.
+4. When Home Assistant sees the first message signed with the link key, it
+   forgets the key from the code. From then on the code is worth nothing
+   to anyone else: neither a hello nor a scan signed with it is accepted.
+
+What this gives and what not:
+
+- Someone who knows the code and listens later cannot sign as the ring and
+  cannot compute the link key from a recorded pairing.
+- Someone who knows the code and is active on the radio during the few
+  seconds of pairing can still get in the middle. Matter has the same limit.
+- Until step 4 the ring may ask again (the answer may have got lost); the
+  same hello gets the same answer, a new hello a new key.
+- **Deleted in Home Assistant:** the ring still signs with its link key,
+  which Home Assistant no longer knows. After the first refusal the ring
+  offers a new agreement in every other hello, signed with the key from
+  the code; it keeps its old key until a new one is agreed. So whoever has
+  the code and can answer the ring in place of Home Assistant can take the
+  ring over (it then no longer works at home), but cannot sign as the ring
+  towards Home Assistant.
+- **Factory reset** (`ring reset yes`, or "Delete and reset ring"): the
+  ring erases its link key.
+- **Paired before 0.8.0:** Home Assistant still holds the key from the
+  code. The first hello of an updated ring replaces it as above, without
+  entering the code again.
+- **Ring 0.6.0 with an older integration:** the longer hello is answered
+  with 4.00; the ring then sends one without the offer and goes on with
+  the key from the code, and tries again at its next regular hello. Over
+  Bluetooth there is no such fallback.
+
 ## Signed messages
 
 `mac` is the first 8 bytes of `HMAC-SHA256(key, text)` as 16 lower-case hex

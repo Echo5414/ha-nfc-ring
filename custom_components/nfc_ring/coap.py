@@ -46,7 +46,7 @@ CONFIG_PATH = "cfg"  # POST to the ring: encrypted settings (auth.seal_cfg)
 
 # A signed scan is ~140 bytes, a hello up to ~200; the cap also keeps json.loads far from
 # Python's recursion limit on hostile input like "[[[[...".
-MAX_PAYLOAD = 256
+MAX_PAYLOAD = 384
 
 # Largest Block2 size we serve (SZX 6 = 1024 bytes).
 MAX_BLOCK_SZX = 6
@@ -65,6 +65,7 @@ _DEV_RE = re.compile(r"[0-9a-f]{16}")
 _UID_RE = re.compile(r"(?:[0-9A-F]{2}){1,10}")
 _VERSION_RE = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,5}")
 _MAC_RE = re.compile(r"[0-9a-f]{16}")
+_PK_RE = re.compile(r"[0-9a-f]{64}")
 # Board, build variant and radio names; "|" must stay out, it separates the
 # fields of the signed text.
 _NAME_RE = re.compile(r"[a-z0-9_]{1,24}")
@@ -122,6 +123,11 @@ class Hello:
     board: str | None = None
     variant: str | None = None
     radio: str | None = None
+    # From firmware 0.6.0 on, while the ring has no key of its own (both or
+    # none): its public key for the key agreement and the MAC that ties it
+    # to this hello.
+    pk: str | None = None
+    pm: str | None = None
 
 
 @dataclass(frozen=True)
@@ -236,9 +242,9 @@ def build_message(
     return header + body
 
 
-def build_ack(msg: CoapMessage, code: int) -> bytes:
-    """Piggybacked response without payload to a confirmable request."""
-    return build_message(TYPE_ACK, code, msg.mid, msg.token)
+def build_ack(msg: CoapMessage, code: int, payload: bytes = b"") -> bytes:
+    """Piggybacked response to a confirmable request, usually without payload."""
+    return build_message(TYPE_ACK, code, msg.mid, msg.token, None, payload)
 
 
 def build_block_response(msg: CoapMessage, block: Block, data: bytes) -> bytes:
@@ -336,7 +342,18 @@ def parse_hello(payload: bytes) -> Hello:
         isinstance(name, str) and _NAME_RE.fullmatch(name) for name in names
     ):
         raise ValueError("bad board/var/radio")
-    return Hello(dev, fw, sid, confirmed, *_signature(hello), *names)
+    signature = _signature(hello)
+    pk, pm = hello.get("pk"), hello.get("pm")
+    if pk is not None or pm is not None:
+        if not (
+            signature[2] is not None
+            and isinstance(pk, str)
+            and _PK_RE.fullmatch(pk)
+            and isinstance(pm, str)
+            and _MAC_RE.fullmatch(pm)
+        ):
+            raise ValueError("bad pk/pm")
+    return Hello(dev, fw, sid, confirmed, *signature, *names, pk, pm)
 
 
 def image_version(image: bytes) -> str:

@@ -41,6 +41,9 @@ const TEXT = {
     scanManual: "Type it instead",
     scanWrong: "This is not a ring's pairing code.",
     pairedNow: "The ring is paired.",
+    pairingNow: "Code accepted. The ring is paired as soon as it reports or reads a tag, usually within a minute.",
+    pairingPill: "Pairing…",
+    pairingHint: "Code accepted. Waiting for the ring to report or read a tag.",
     waiting: "Code saved. The ring is paired as soon as it reports or reads a tag, usually within a minute. Switch it on if it is off.",
     invalidCode: "This is not a pairing code. It has 20 characters, for example ABCDE-12345-FGHJK-67890.",
     pairFailed: "Pairing did not work: {e}",
@@ -109,6 +112,9 @@ const TEXT = {
     scanManual: "Lieber eintippen",
     scanWrong: "Das ist kein Kopplungscode eines Rings.",
     pairedNow: "Der Ring ist gekoppelt.",
+    pairingNow: "Code angenommen. Der Ring wird gekoppelt, sobald er sich meldet oder einen Tag liest, meist innerhalb einer Minute.",
+    pairingPill: "Wird gekoppelt …",
+    pairingHint: "Code angenommen. Wartet darauf, dass der Ring sich meldet oder einen Tag liest.",
     waiting: "Code gespeichert. Der Ring wird gekoppelt, sobald er sich meldet oder einen Tag liest, meist innerhalb einer Minute. Ring einschalten, falls er aus ist.",
     invalidCode: "Das ist kein Kopplungscode. Er hat 20 Zeichen, zum Beispiel ABCDE-12345-FGHJK-67890.",
     pairFailed: "Koppeln hat nicht geklappt: {e}",
@@ -225,10 +231,15 @@ class NfcRingPanel extends HTMLElement {
       // The code found its ring, or ran out.
       this._pairMsg = this._data.rings.length > this._ringsBefore ? { kind: "ok", text: t.pairedNow } : null;
     }
+    const pairing = !!this._data?.rings.some((r) => r.pairing);
+    if (this._pairMsg?.text === t.pairingNow && this._data && !pairing) {
+      // The ring has its key.
+      this._pairMsg = { kind: "ok", text: t.pairedNow };
+    }
     this._render();
     clearTimeout(this._poll);
     // New rings and a waiting code change without any entity changing.
-    if (this._data?.waiting) this._poll = setTimeout(() => this._load(), 3000);
+    if (this._data?.waiting || pairing) this._poll = setTimeout(() => this._load(), 3000);
   }
 
   async _pair() {
@@ -241,7 +252,10 @@ class NfcRingPanel extends HTMLElement {
     try {
       const result = await this._hass.callWS({ type: "nfc_ring/pair", code });
       input.value = "";
-      this._pairMsg = result.status === "paired" ? { kind: "ok", text: t.pairedNow } : { kind: "info", text: t.waiting };
+      this._pairMsg =
+        result.status === "paired"
+          ? { kind: "ok", text: t.pairedNow }
+          : { kind: "info", text: result.status === "pairing" ? t.pairingNow : t.waiting };
     } catch (err) {
       this._pairMsg = {
         kind: "err",
@@ -407,6 +421,8 @@ class NfcRingPanel extends HTMLElement {
         : `<span class="pill on">${t.active}</span>`;
       const pairing = r.paired
         ? `<span class="pill on">${t.paired}</span>`
+        : r.pairing
+        ? `<span class="pill warn">${t.pairingPill}</span><div class="note">${t.pairingHint}</div>`
         : `<span class="pill warn">${t.unpaired}</span><div class="note">${r.can_pair ? t.unpairedReady : t.unpairedHint}</div>`;
       const fw = r.update_available
         ? `${esc(r.firmware || "–")} <span class="pill warn">${esc(t.update.replace("{v}", r.latest_firmware || "?"))}</span>`

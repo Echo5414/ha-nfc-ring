@@ -10,6 +10,11 @@ Sends one hello or scan as CoAP over UDP and prints Home Assistant's answer
 --unsigned leaves the signature away (firmware before 0.4.0), --bad-mac
 breaks it, --times 2 sends the identical message again as a new request (a
 recorded message played back).
+
+Firmware 0.6.0 on agrees on a key of its own: "hello --offer" adds the
+public key, and if Home Assistant answers the agreement, prints "2.04 key"
+and stores the key in --keyfile. With --keyfile holding a key, messages are
+signed with it instead of the key from the code.
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ def main() -> int:
     ap.add_argument("--unsigned", action="store_true")
     ap.add_argument("--bad-mac", action="store_true")
     ap.add_argument("--times", type=int, default=1)
+    ap.add_argument("--keyfile", type=Path, help="holds the agreed key as hex, once there is one")
     sub = ap.add_subparsers(dest="what", required=True)
     hello = sub.add_parser("hello")
     hello.add_argument("--fw", default="0.4.0")
@@ -53,6 +59,8 @@ def main() -> int:
     hello.add_argument("--board", help="say hello like firmware 0.5.0 on, naming this board")
     hello.add_argument("--var", default="thread", help="firmware build (with --board)")
     hello.add_argument("--radio", default="thread", help="radio in use (with --board)")
+    hello.add_argument("--offer", action="store_true", help="offer a key agreement (needs --board)")
+    hello.add_argument("--bad-offer", action="store_true", help="break the offer's own MAC")
     scan = sub.add_parser("scan")
     scan.add_argument("--uid", default="04D00D")
     scan.add_argument("--seq", type=int, default=1)
@@ -79,14 +87,32 @@ def main() -> int:
         text = auth.scan_text(args.dev, args.uid, args.sid, args.seq, args.boot, args.n)
         path = coap.SCAN_PATH
 
+    offer = args.what == "hello" and args.offer
+    private = None
     if not args.unsigned:
         code = auth.normalize_code(args.code or "")
         if code is None:
             ap.error("--code is not a pairing code")
-        mac = auth.mac(auth.derive_key(code, args.dev), text)
+        code_key = auth.derive_key(code, args.dev)
+        key = code_key
+        if not offer and args.keyfile and args.keyfile.exists():
+            key = bytes.fromhex(args.keyfile.read_text().strip())
+        mac = auth.mac(key, text)
         if args.bad_mac:
             mac = mac[:-1] + ("0" if mac[-1] != "0" else "1")
         fields.update(boot=args.boot, n=args.n, mac=mac)
+        if offer:
+            from cryptography.hazmat.primitives.asymmetric.x25519 import (
+                X25519PrivateKey,
+                X25519PublicKey,
+            )
+
+            private = X25519PrivateKey.generate()
+            pk = private.public_key().public_bytes_raw().hex()
+            pm = auth.mac(code_key, auth.offer_text(args.dev, pk, args.boot, args.n))
+            if args.bad_offer:
+                pm = pm[:-1] + ("0" if pm[-1] != "0" else "1")
+            fields.update(pk=pk, pm=pm)
 
     payload = json.dumps(fields, separators=(",", ":")).encode()
     options = [
@@ -112,7 +138,23 @@ def main() -> int:
             except TimeoutError:
                 print("no answer")
                 return 2
-            print(f"{reply.code >> 5}.{reply.code & 0x1F:02d}")
+            answer = f"{reply.code >> 5}.{reply.code & 0x1F:02d}"
+            if private is not None and reply.payload:
+                got = json.loads(reply.payload)
+                want = auth.mac(
+                    code_key, auth.pair_text(args.dev, pk, got["pk"], args.boot, args.n)
+                )
+                if got["mac"] != want:
+                    answer += " badpair"
+                else:
+                    shared = private.exchange(
+                        X25519PublicKey.from_public_bytes(bytes.fromhex(got["pk"]))
+                    )
+                    link = auth.link_key(shared, args.dev, pk, got["pk"])
+                    if args.keyfile:
+                        args.keyfile.write_text(link.hex())
+                    answer += " key"
+            print(answer)
     return 0
 
 
