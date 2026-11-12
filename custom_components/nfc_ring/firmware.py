@@ -81,6 +81,9 @@ def newest(*candidates: Firmware | None) -> Firmware | None:
     return best
 
 
+_warned: set[str] = set()
+
+
 def find_local(directory: Path) -> dict[Target, Firmware]:
     """Newest valid image per board and build in directory (blocking)."""
     best: dict[Target, Firmware] = {}
@@ -92,10 +95,13 @@ def find_local(directory: Path) -> dict[Target, Firmware]:
     for path in files:
         target = coap.image_target(path.name)
         if target is None:
-            _LOGGER.warning(
-                "Ignoring firmware file %s: name it nfc-ring-<board>-<build>-<version>.bin",
-                path.name,
-            )
+            if path.name not in _warned:
+                # The folder is read every few hours: say it once.
+                _warned.add(path.name)
+                _LOGGER.warning(
+                    "Ignoring firmware file %s: name it nfc-ring-<board>-<build>-<version>.bin",
+                    path.name,
+                )
             continue
         try:
             size = path.stat().st_size

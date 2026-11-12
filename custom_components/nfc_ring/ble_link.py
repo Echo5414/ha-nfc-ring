@@ -143,7 +143,10 @@ class BleLink:
         data = info.manufacturer_data.get(ble.COMPANY_ID)
         frame = ble.parse_frame(bytes(data)) if data else None
         if isinstance(frame, ble.ScanFrame):
-            self._server.ble_scan(info.address, frame)
+            sender = self._frames.get(info.address)
+            self._server.ble_scan(
+                info.address, frame, named=sender.dev if sender is not None else None
+            )
         elif isinstance(frame, ble.IdleFrame):
             for address, known in list(self._frames.items()):
                 if known.dev == frame.dev and address != info.address:

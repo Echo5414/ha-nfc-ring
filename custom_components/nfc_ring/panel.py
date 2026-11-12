@@ -50,6 +50,7 @@ async def async_setup(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, _ws_overview)
     websocket_api.async_register_command(hass, _ws_pair)
     websocket_api.async_register_command(hass, _ws_set_radio)
+    websocket_api.async_register_command(hass, _ws_reset_ring)
 
 
 @callback
@@ -138,6 +139,27 @@ async def _ws_set_radio(
         connection.send_error(msg["id"], "failed", str(err))
         return
     connection.send_result(msg["id"], {"applied": applied})
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/reset_ring", vol.Required("dev"): str}
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def _ws_reset_ring(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Tells a ring to restore its factory settings; an error if it did not confirm."""
+    server = _server(hass)
+    if server is None:
+        connection.send_error(msg["id"], "not_loaded", "NFC Ring is not running")
+        return
+    try:
+        await server.async_reset_ring(msg["dev"])
+    except HomeAssistantError as err:
+        connection.send_error(msg["id"], "failed", str(err))
+        return
+    connection.send_result(msg["id"], {})
 
 
 @callback
@@ -278,6 +300,7 @@ def build_overview(hass: HomeAssistant) -> dict[str, Any]:
                     "latest_firmware": latest,
                     "update_available": update_available,
                     "disabled": device.disabled_by is not None,
+                    "can_reset": server is not None and server.can_reset(dev),
                     "last_scan": last_scan.get(device.id),
                     **(_radio(server, dev, ring) if ring is not None else {}),
                 }

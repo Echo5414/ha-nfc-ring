@@ -118,6 +118,7 @@ _UPDATE_DEADLINE_SECONDS = 20 * 60
 # How long a ring that uses Bluetooth may take to be reached: it has to be
 # in range, and Home Assistant connects to one ring at a time.
 _BLUETOOTH_REACH_SECONDS = 60
+_RESET_FIRMWARE = (0, 5, 2)  # the first that knows the reset message
 
 type NfcRingConfigEntry = ConfigEntry[RingServer]
 
@@ -314,6 +315,7 @@ class RingServer:
         self.ble = None  # ble_link.BleLink while Bluetooth is in use
         self._applying: set[str] = set()  # rings a settings message is on its way to
         self._provisioned: set[str] = set()  # rings given the Thread network unasked
+        self._resetting: set[str] = set()  # rings being told to forget their settings
         self._store: Store[dict[str, dict]] = Store(
             hass, _STORAGE_VERSION, f"{DOMAIN}.rings", private=True  # holds the ring keys
         )
@@ -1251,6 +1253,69 @@ class RingServer:
             return False
         return True
 
+    @callback
+    def can_reset(self, dev: str) -> bool:
+        """True if this ring can be told to restore its factory settings."""
+        ring = self.rings.get(dev)
+        return (
+            ring is not None
+            and ring.key is not None
+            and ring.sid is not None
+            and coap.version_key(ring.fw or "0") >= _RESET_FIRMWARE
+        )
+
+    async def async_reset_ring(self, dev: str) -> None:
+        """Tells a ring to forget its network, our address and its radio choice.
+
+        It restarts as it left production and keeps its pairing code. Raises
+        if the ring did not confirm; nothing has changed then.
+        """
+        ring = self.rings.get(dev)
+        if ring is None or ring.key is None:
+            raise HomeAssistantError("This ring is not paired")
+        if not self.can_reset(dev):
+            raise HomeAssistantError(
+                "This ring's firmware cannot do that yet; update it first, or delete "
+                "the ring without resetting it"
+            )
+        if dev in self._resetting or dev in self._applying or dev in self.updates:
+            raise HomeAssistantError("Something else is on its way to this ring")
+        self._resetting.add(dev)
+        try:
+            if ring.link == LINK_BLUETOOTH:
+                if self.ble is None:
+                    raise HomeAssistantError("Bluetooth is not available in Home Assistant")
+                answer = await self.ble.async_send_settings(dev, _BLUETOOTH_REACH_SECONDS)
+                if answer is None:
+                    raise HomeAssistantError("The ring could not be reached over Bluetooth")
+                if answer != ble.CFG_OK:
+                    raise HomeAssistantError(f"The ring refused (code {answer})")
+            else:
+                if ring.address is None:
+                    raise HomeAssistantError("The ring has not checked in yet")
+                sealed = self._sealed_reset(dev, ring)
+                code = await self._async_request(
+                    ring, lambda mid, token: coap.build_config(mid, token, sealed)
+                )
+                if code is None:
+                    raise HomeAssistantError(
+                        "The ring did not answer. It has to be switched on and in range"
+                    )
+                if code >> 5 != 2:
+                    raise HomeAssistantError(
+                        f"The ring refused (CoAP {code >> 5}.{code & 0x1F:02d})"
+                    )
+            _LOGGER.info("Ring %s restores its factory settings", dev)
+        finally:
+            self._resetting.discard(dev)
+
+    @callback
+    def _sealed_reset(self, dev: str, ring: Ring) -> bytes:
+        ring.cfg_ctr = max(ring.cfg_ctr + 1, int(time.time())) & 0xFFFFFFFF
+        return auth.seal_cfg(
+            ring.key, dev, ring.sid, ring.replay.boot, ring.cfg_ctr, {"reset": "factory"}
+        )
+
     async def _async_apply_quietly(self, dev: str) -> None:
         try:
             await self._async_apply_radio(dev)
@@ -1348,6 +1413,8 @@ class RingServer:
         session = self.updates.get(dev)
         if session is not None and session.notice_answer is not None and not session.notice_answer.done():
             return True
+        if dev in self._resetting:
+            return True
         ring = self.rings.get(dev)
         return ring is not None and ring.link == LINK_BLUETOOTH and self._settings_due(dev)
 
@@ -1376,11 +1443,18 @@ class RingServer:
         return hello, _compact({"st": "ok", "mac": mac})
 
     @callback
-    def ble_scan(self, ble_address: str, scan: ble.ScanFrame, dev: str | None = None) -> None:
+    def ble_scan(
+        self,
+        ble_address: str,
+        scan: ble.ScanFrame,
+        dev: str | None = None,
+        named: str | None = None,
+    ) -> None:
         """A scan from an advertisement or a connection.
 
         The frame does not name its ring: whichever paired ring's key fits
-        the signature sent it.
+        the signature sent it. named is the ring that advertises from this
+        address, if it said so; that is what a ring not paired here goes by.
         """
         if dev is not None:
             devs = [dev]
@@ -1406,6 +1480,43 @@ class RingServer:
                 self.hass, self._handle_ble_scan(candidate, scan.uid), f"{DOMAIN} scan"
             )
             return
+        if named is not None and dev is None:
+            self._ble_scan_unpaired(ble_address, scan, named)
+
+    @callback
+    def _ble_scan_unpaired(self, ble_address: str, scan: ble.ScanFrame, dev: str) -> None:
+        """A scan of a ring that is not paired here, for example a deleted one.
+
+        Over Bluetooth a scan gets no answer, so the ring never learns that
+        it was refused and says hello only rarely. Its signed scan proves an
+        entered code just as well, now or later.
+        """
+        ring = self.rings.get(dev)
+        if ring is not None and ring.key is not None:
+            return  # paired, and the signature did not fit
+        text = auth.ble_scan_text(dev, scan.uid, scan.boot, scan.n)
+        candidate = Candidate(text, scan.mac, scan.boot, scan.n)
+        heard = self.pending.get(dev)
+        known = PendingRing(
+            None, None, heard.fw if heard else "", time.time(), candidate, LINK_BLUETOOTH, ble_address
+        )
+        key = self._key_from_waiting_code(dev, text, scan.mac)
+        if key is not None:
+            try:
+                self._pair(dev, key, known)
+            except HomeAssistantError as err:
+                _LOGGER.warning("Cannot pair ring %s: %s", dev, err)
+                return
+            self.ble_scan(ble_address, scan, dev)
+        elif ring is not None:
+            ring.candidate = candidate
+        elif heard is None or heard.candidate is None or (
+            (heard.candidate.boot, heard.candidate.n) != (scan.boot, scan.n)
+        ):
+            self.pending.pop(dev, None)
+            while len(self.pending) >= MAX_PENDING_RINGS:
+                del self.pending[next(iter(self.pending))]
+            self.pending[dev] = known
 
     async def _handle_ble_scan(self, dev: str, uid: str) -> None:
         try:
@@ -1418,6 +1529,8 @@ class RingServer:
     async def async_ble_settings(self, dev: str) -> bytes | None:
         """The settings message due for a connected ring, or None."""
         ring = self.rings.get(dev)
+        if dev in self._resetting and ring is not None and ring.key is not None:
+            return self._sealed_reset(dev, ring)
         if (
             ring is not None
             and ring.key is not None
@@ -1445,6 +1558,8 @@ class RingServer:
     @callback
     def ble_settings_answer(self, dev: str, answer: int | None) -> None:
         """The connected ring's answer to the settings message."""
+        if dev in self._resetting:
+            return  # async_reset_ring is told by the link
         if answer == ble.CFG_OK and self._settings_due(dev):
             self._settings_taken(dev)
         elif answer is not None:

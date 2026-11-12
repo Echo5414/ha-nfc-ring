@@ -56,6 +56,10 @@ const TEXT = {
     remove: "Delete",
     removeSure: "Really delete?",
     removed: "The ring is deleted. To use it again, enter its code.",
+    removeReset: "Delete and reset ring",
+    resetHint: "The ring also forgets the Thread network and Home Assistant and restarts with its factory settings. It has to be set up again afterwards. Its code stays the same.",
+    removedReset: "The ring is deleted and back to its factory settings. It has to be set up again before it can be paired.",
+    resetFailed: "The ring was not reset and not deleted: {e}",
     actionFailed: "That did not work: {e}",
     deletedRing: "deleted ring",
     error: "The overview could not be loaded.",
@@ -120,6 +124,10 @@ const TEXT = {
     remove: "Löschen",
     removeSure: "Wirklich löschen?",
     removed: "Der Ring ist gelöscht. Um ihn wieder zu nutzen, seinen Code eingeben.",
+    removeReset: "Löschen und Ring zurücksetzen",
+    resetHint: "Der Ring vergisst zusätzlich das Thread-Netz und Home Assistant und startet mit Werkseinstellungen neu. Danach muss er neu eingerichtet werden. Sein Code bleibt gleich.",
+    removedReset: "Der Ring ist gelöscht und auf Werkseinstellungen zurückgesetzt. Er muss neu eingerichtet werden, bevor er wieder gekoppelt werden kann.",
+    resetFailed: "Der Ring wurde nicht zurückgesetzt und nicht gelöscht: {e}",
     actionFailed: "Das hat nicht geklappt: {e}",
     deletedRing: "gelöschter Ring",
     error: "Die Übersicht konnte nicht geladen werden.",
@@ -312,7 +320,7 @@ class NfcRingPanel extends HTMLElement {
       this._sureTimer = setTimeout(() => {
         this._sure = null;
         this._render();
-      }, 6000);
+      }, 8000);
       this._render();
       return;
     }
@@ -320,14 +328,23 @@ class NfcRingPanel extends HTMLElement {
     this._sure = null;
     this._ringBusy = true;
     this._radioMsg = null;
+    this._render();
     try {
-      if (action === "remove") {
+      if (action === "reset") {
+        // The ring has to confirm first; only then is it deleted here.
+        try {
+          await this._hass.callWS({ type: "nfc_ring/reset_ring", dev: ring.dev });
+        } catch (err) {
+          throw new Error(t.resetFailed.replace("{e}", err?.message || "?"));
+        }
+      }
+      if (action === "remove" || action === "reset") {
         await this._hass.callWS({
           type: "config/device_registry/remove_config_entry",
           device_id: id,
           config_entry_id: ring.entry,
         });
-        this._radioMsg = { kind: "ok", text: t.removed };
+        this._radioMsg = { kind: "ok", text: action === "reset" ? t.removedReset : t.removed };
       } else {
         await this._hass.callWS({
           type: "config/device_registry/update",
@@ -336,7 +353,8 @@ class NfcRingPanel extends HTMLElement {
         });
       }
     } catch (err) {
-      this._radioMsg = { kind: "err", text: t.actionFailed.replace("{e}", err?.message || "?") };
+      const own = action === "reset" && err instanceof Error && err.message.startsWith(t.resetFailed.split("{e}")[0]);
+      this._radioMsg = { kind: "err", text: own ? err.message : t.actionFailed.replace("{e}", err?.message || "?") };
     } finally {
       this._ringBusy = false;
     }
@@ -404,6 +422,7 @@ class NfcRingPanel extends HTMLElement {
           <td data-l="${t.actions}"><div class="acts">
             <button type="button" class="act" data-id="${esc(r.id)}" data-act="${r.disabled ? "activate" : "deactivate"}">${r.disabled ? t.activate : t.deactivate}</button>
             <button type="button" class="act danger${this._sure === r.id ? " sure" : ""}" data-id="${esc(r.id)}" data-act="remove">${this._sure === r.id ? t.removeSure : t.remove}</button>
+            ${this._sure === r.id && r.can_reset ? `<button type="button" class="act danger" data-id="${esc(r.id)}" data-act="reset" title="${esc(t.resetHint)}">${t.removeReset}</button>` : ""}
           </div></td>
         </tr>`;
     });

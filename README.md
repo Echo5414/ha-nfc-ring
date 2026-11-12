@@ -68,6 +68,12 @@ goes into **Settings → Devices & services → NFC Ring → Configure**.
 - **Delete a ring:** press **Delete** in its row on the page, twice. Its
   key is forgotten; to use it again, enter its code again. The ring is
   paired again at its next scan or report.
+- **Delete and reset a ring** (to give it away): after the first press,
+  **Delete and reset ring** appears next to it (ring firmware 0.5.2 or
+  newer). The ring also forgets the Thread network and Home Assistant and
+  restarts with its factory settings; it has to be set up again before it
+  can be paired. It must be switched on and in range: without its
+  confirmation nothing is deleted. Its code stays the same.
 - **Rings set up before version 0.6.0** keep working and are shown as "Not
   paired". Update their firmware to 0.4.0 or newer, then enter the code. A
   development board prints its code with the shell command `ring code`.
